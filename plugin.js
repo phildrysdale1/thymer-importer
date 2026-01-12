@@ -1,9 +1,9 @@
-const VERSION = 'v0.0.1';
+const VERSION = 'v0.0.2';
 /**
  * Obsidian Import Plugin for Thymer
  * 
- * COMMAND 1: Scan Obsidian Vault - Analyzes frontmatter and generates collection schema
- * COMMAND 2: Import Obsidian Vault - Imports markdown files to collection
+ * COMMAND 1: "Scan Obsidian Vault" - Analyzes frontmatter and generates collection schema
+ * COMMAND 2: "Import Obsidian Vault" - Imports markdown files to collection
  */
 
 class Plugin extends AppPlugin {
@@ -392,6 +392,12 @@ class Plugin extends AppPlugin {
             const fieldId = this.slugify(prop.key);
             if (!fieldId) continue;
 
+            // Skip if we already have a field with this ID
+            if (fields.find(f => f.id === fieldId)) {
+                console.log(`[Schema] Skipping duplicate field ID "${fieldId}" (from "${prop.key}")`);
+                continue;
+            }
+
             // Force common date field names to be datetime type
             const commonDateFields = ['created', 'modified', 'updated', 'created_at', 'modified_at', 'updated_at', 'date', 'created_date', 'modified_date'];
             const isCommonDateField = commonDateFields.includes(fieldId) || commonDateFields.includes(prop.key.toLowerCase());
@@ -662,6 +668,8 @@ class Plugin extends AppPlugin {
         let updated = 0;
         let errors = 0;
 
+        console.log(`[Import] Processing ${files.length} files`);
+
         const existingRecords = await collection.getAllRecords();
         const existingByTitle = new Map();
         
@@ -672,27 +680,72 @@ class Plugin extends AppPlugin {
             }
         }
 
+        // PHASE 1: Create all records with properties and markdown (wiki-links unchanged)
+        this.showToast('Phase 1: Creating records with content...', 2000);
+
         for (let i = 0; i < files.length; i++) {
             const file = files[i];
 
             try {
                 if (i % 10 === 0) {
-                    this.showToast(`Importing ${i + 1}/${files.length}`, 500);
+                    this.showToast(`Creating ${i + 1}/${files.length}`, 500);
                 }
 
                 const fileHandle = await file.handle.getFile();
                 const content = await fileHandle.text();
                 const { frontmatter, markdown } = this.parseMarkdownFile(content);
 
-                console.log(`[Import] Processing "${file.name}" - Markdown length: ${markdown ? markdown.length : 0} chars`);
-
                 const existing = existingByTitle.get(file.name.toLowerCase());
 
                 if (existing) {
-                    await this.updateRecord(existing, frontmatter, markdown, file.topFolder);
+                    // Update existing record
+                    this.setFieldValue(existing, 'folder', file.topFolder);
+                    for (const [key, value] of Object.entries(frontmatter)) {
+                        if (value === null || value === undefined || value === '') continue;
+                        this.setFrontmatterField(existing, key, value);
+                    }
+                    
+                    // Insert markdown WITHOUT converting wiki-links
+                    if (markdown) {
+                        const convertedMarkdown = this.convertMarkdown(markdown);
+                        if (window.syncHub && window.syncHub.insertMarkdown) {
+                            try {
+                                const textProp = existing.prop('text');
+                                if (textProp) textProp.set('');
+                                await window.syncHub.insertMarkdown(convertedMarkdown, existing, null);
+                            } catch (error) {
+                                console.error(`[Import] insertMarkdown failed for ${existing.getName()}:`, error);
+                            }
+                        }
+                    }
                     updated++;
                 } else {
-                    await this.createRecord(collection, file.name, frontmatter, markdown, file.topFolder);
+                    // Create new record
+                    const recordGuid = collection.createRecord(file.name);
+                    if (!recordGuid) throw new Error('Failed to create record');
+
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                    const records = await collection.getAllRecords();
+                    const record = records.find(r => r.guid === recordGuid);
+                    if (!record) throw new Error('Record not found');
+
+                    this.setFieldValue(record, 'folder', file.topFolder);
+                    for (const [key, value] of Object.entries(frontmatter)) {
+                        if (value === null || value === undefined || value === '') continue;
+                        this.setFrontmatterField(record, key, value);
+                    }
+
+                    // Insert markdown WITHOUT converting wiki-links
+                    if (markdown) {
+                        const convertedMarkdown = this.convertMarkdown(markdown);
+                        if (window.syncHub && window.syncHub.insertMarkdown) {
+                            try {
+                                await window.syncHub.insertMarkdown(convertedMarkdown, record, null);
+                            } catch (error) {
+                                console.error(`[Import] insertMarkdown failed for ${file.name}:`, error);
+                            }
+                        }
+                    }
                     imported++;
                 }
 
@@ -702,85 +755,145 @@ class Plugin extends AppPlugin {
             }
         }
 
+        // PHASE 2: Resolve wiki-links using segments API
+        this.showToast('Phase 2: Resolving wiki-links...', 2000);
+        await this.resolveWikiLinksWithSegments(collection);
+
         this.showToast(`Done! Imported: ${imported} | Updated: ${updated} | Errors: ${errors}`, 10000);
     }
 
-    async createRecord(collection, title, frontmatter, markdown, topFolder) {
-        const recordGuid = collection.createRecord(title);
-        if (!recordGuid) throw new Error('Failed to create record');
-
-        await new Promise(resolve => setTimeout(resolve, 50));
+    async resolveWikiLinksWithSegments(collection) {
         const records = await collection.getAllRecords();
-        const record = records.find(r => r.guid === recordGuid);
-        if (!record) throw new Error('Record not found');
-
-        this.setFieldValue(record, 'folder', topFolder);
-
-        for (const [key, value] of Object.entries(frontmatter)) {
-            if (value === null || value === undefined || value === '') continue;
-            this.setFrontmatterField(record, key, value);
-        }
-
-        if (markdown) {
-            const convertedMarkdown = this.convertMarkdown(markdown);
-            
-            if (window.syncHub && window.syncHub.insertMarkdown) {
-                try {
-                    await window.syncHub.insertMarkdown(convertedMarkdown, record, null);
-                } catch (error) {
-                    console.error(`[Import] insertMarkdown failed for ${title}:`, error);
-                    const textProp = record.prop('text');
-                    if (textProp) {
-                        textProp.set(convertedMarkdown);
-                    }
-                }
-            } else {
-                const textProp = record.prop('text');
-                if (textProp) {
-                    textProp.set(convertedMarkdown);
-                }
+        const nameToRecord = new Map();
+        
+        // Build lookup map
+        console.log('[WikiLinks] Building name→record lookup map...');
+        for (const record of records) {
+            const name = record.getName();
+            if (name) {
+                nameToRecord.set(name.toLowerCase(), record);
             }
         }
-
-        return record;
-    }
-
-    async updateRecord(record, frontmatter, markdown, topFolder) {
-        this.setFieldValue(record, 'folder', topFolder);
-
-        for (const [key, value] of Object.entries(frontmatter)) {
-            if (value === null || value === undefined || value === '') continue;
-            this.setFrontmatterField(record, key, value);
-        }
-
-        if (markdown) {
-            const convertedMarkdown = this.convertMarkdown(markdown);
-            
-            if (window.syncHub && window.syncHub.insertMarkdown) {
-                try {
-                    const textProp = record.prop('text');
-                    if (textProp) {
-                        textProp.set('');
+        
+        let linksFound = 0;
+        let linksResolved = 0;
+        
+        // Process each record
+        for (const record of records) {
+            try {
+                console.log(`[WikiLinks] Processing record: ${record.getName()}`);
+                const lineItems = await record.getLineItems();
+                
+                if (!lineItems || lineItems.length === 0) {
+                    console.log(`[WikiLinks]   No line items found`);
+                    continue;
+                }
+                
+                console.log(`[WikiLinks]   Found ${lineItems.length} line items`);
+                
+                for (let i = 0; i < lineItems.length; i++) {
+                    const lineItem = lineItems[i];
+                    
+                    // Debug: Check what properties/methods the lineItem has
+                    if (i === 0) {
+                        console.log('[WikiLinks]   Line item properties:', Object.keys(lineItem));
+                        console.log('[WikiLinks]   Has segments property?', 'segments' in lineItem);
+                        console.log('[WikiLinks]   Has getSegments method?', typeof lineItem.getSegments);
+                        console.log('[WikiLinks]   Line item:', lineItem);
                     }
                     
-                    await window.syncHub.insertMarkdown(convertedMarkdown, record, null);
-                } catch (error) {
-                    console.error(`[Import] insertMarkdown failed for ${record.getName()}:`, error);
-                    const textProp = record.prop('text');
-                    if (textProp) {
-                        textProp.set(convertedMarkdown);
+                    // Try accessing segments as a property
+                    const segments = lineItem.segments || null;
+                    
+                    if (!segments || segments.length === 0) {
+                        if (i === 0) console.log(`[WikiLinks]   No segments found in line item`);
+                        continue;
                     }
+                    
+                    console.log(`[WikiLinks]   Line ${i}: ${segments.length} segments`);
+                    
+                    // Check if any text segment contains [[...]]
+                    let hasWikiLinks = false;
+                    for (const segment of segments) {
+                        if (segment.type === 'text' && segment.text && segment.text.includes('[[')) {
+                            hasWikiLinks = true;
+                            console.log(`[WikiLinks]     Found wiki-link in text: "${segment.text}"`);
+                            break;
+                        }
+                    }
+                    
+                    if (!hasWikiLinks) continue;
+                    
+                    // Build new segments array with refs
+                    const newSegments = [];
+                    
+                    for (const segment of segments) {
+                        if (segment.type === 'text' && segment.text && segment.text.includes('[[')) {
+                            const wikiLinkRegex = /\[\[([^\]]+)\]\]/g;
+                            let lastIndex = 0;
+                            let match;
+                            
+                            while ((match = wikiLinkRegex.exec(segment.text)) !== null) {
+                                linksFound++;
+                                const noteName = match[1].trim();
+                                const targetRecord = nameToRecord.get(noteName.toLowerCase());
+                                
+                                // Add text before the link
+                                if (match.index > lastIndex) {
+                                    const textBefore = segment.text.substring(lastIndex, match.index);
+                                    newSegments.push({
+                                        type: 'text',
+                                        text: textBefore
+                                    });
+                                    console.log(`[WikiLinks]     Text before: "${textBefore}"`);
+                                }
+                                
+                                // Add ref segment or keep as text if not found
+                                if (targetRecord) {
+                                    newSegments.push({
+                                        type: 'ref',
+                                        text: targetRecord.guid
+                                    });
+                                    linksResolved++;
+                                    console.log(`[WikiLinks]     ✓ Resolved "${noteName}" → ${targetRecord.guid}`);
+                                } else {
+                                    newSegments.push({
+                                        type: 'text',
+                                        text: match[0]
+                                    });
+                                    console.log(`[WikiLinks]     ✗ Could not resolve "${noteName}" (not found)`);
+                                }
+                                
+                                lastIndex = match.index + match[0].length;
+                            }
+                            
+                            // Add remaining text after last link
+                            if (lastIndex < segment.text.length) {
+                                const textAfter = segment.text.substring(lastIndex);
+                                newSegments.push({
+                                    type: 'text',
+                                    text: textAfter
+                                });
+                                console.log(`[WikiLinks]     Text after: "${textAfter}"`);
+                            }
+                        } else {
+                            // Keep non-text segments as-is
+                            newSegments.push(segment);
+                        }
+                    }
+                    
+                    // Update line item with new segments
+                    console.log(`[WikiLinks]   Updating line with ${newSegments.length} segments`);
+                    await lineItem.setSegments(newSegments);
                 }
-            } else {
-                const textProp = record.prop('text');
-                if (textProp) {
-                    textProp.set('');
-                    textProp.set(convertedMarkdown);
-                }
+                
+            } catch (error) {
+                console.error(`[WikiLinks] Error processing ${record.getName()}:`, error);
             }
         }
-
-        return record;
+        
+        console.log(`[WikiLinks] Complete: Found ${linksFound} links, resolved ${linksResolved}`);
+        this.showToast(`Found ${linksFound} wiki-links, resolved ${linksResolved}`, 5000);
     }
 
     setFrontmatterField(record, frontmatterKey, value) {
