@@ -31,6 +31,7 @@ This plugin is **functional but still experimental**. Please read this section c
 - Not all Markdown features can be represented in Thymer yet
   - Tables are not supported in Thymer and will be lost
   - Some advanced or non-standard Markdown may not paste cleanly
+  - Links within frontmatter are not created as links in Thymer they will remain in [[wikilink]] format
 - Text files only
   - Attachments (images, PDFs, etc.) are not imported
 
@@ -39,7 +40,7 @@ This plugin is **functional but still experimental**. Please read this section c
   - Frontmatter arrays are converted to comma-separated text
 - Frontmatter must appear at the very start of the file
   - Inline or mid-document frontmatter is ignored
-- Only properties that appear in more than 5% of files are included in the generated schema
+- Only properties that appear in more than 5% of files are included in the generated schema (I plan to change this in the next update - it felt like a good idea at the time)
 - If your frontmatter deviates significantly from standard Obsidian usage, manual code tweaks may be required
 
 ### Structure & Sync Behaviour
