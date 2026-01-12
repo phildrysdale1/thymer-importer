@@ -93,12 +93,14 @@ This plugin is **functional but still experimental**. Please read this section c
 
 ## Usage
 
+⚠️ **Known issue:**
+On both step 1 and 3, when opening up your file manager to select the vault, it can occasionally throw an error and fail to do so. This is almost always resolved by trying a couple of times again. I'm trying to figure out what it is. 
+
 ### Step 1: Scan Your Vault
 
 1. Run the command (Cmd/Ctrl+P): **“Scan Obsidian Vault”**
 2. Enter a name for your vault (e.g. *Personal Notes*)
 3. Select your Obsidian vault folder
-  - NOTE: There is currently a bug where, occasionally, opening the file manager to select your folder throws an error. If this happens, simply repeat steps 1-3 again and it will work.
 4. Wait for the scan to complete
 
 The plugin creates a note in your **Notes** collection (ensure you have a “Notes” collection) containing:
