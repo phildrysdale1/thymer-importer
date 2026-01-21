@@ -1,6 +1,8 @@
-# Unified Import Plugin for Thymer
+# Thymer Importer Plugin
 
-A comprehensive import plugin that brings your data into Thymer from multiple sources with a modern, streamlined interface.
+An import plugin that brings your data into Thymer from multiple sources with a streamlined interface.
+Currently supports CSV & Markdown (specifically trained on Obsidian). 
+Coming soon: Amplenote, Capacities, Logseq & Workflowy
 
 ## Features
 
