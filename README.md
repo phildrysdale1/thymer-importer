@@ -1,182 +1,203 @@
-# thymer-importer
+# Unified Import Plugin for Thymer
 
-A plugin to import notes from other apps into **Thymer**, with a current focus on Obsidian vaults.
+A comprehensive import plugin that brings your data into Thymer from multiple sources with a modern, streamlined interface.
 
-This plugin prioritises **schema discovery and data preservation** over perfect fidelity, aiming to get your notes usable in Thymer as safely and transparently as possible.
+## Features
 
-## Project Status
-- Tested on three Obsidian vaults with varying naming conventions and frontmatter styles
-- Actively under development
-- Contributions and test reports are very welcome, especially:
-  - Support for additional frontmatter schemas
-  - Other Markdown-based note apps
-  - Performance and reliability improvements
+### 📊 CSV Import
+- **Paste or Upload**: Import CSV data by pasting directly or uploading a file
+- **Smart Type Detection**: Automatically detects field types from your data
+- **Type Hints Support**: Add a second row with type names (`text`, `number`, `choice`, etc.) to skip configuration
+- **Auto-Create Collections**: Creates new collections with proper schemas or imports to existing ones
+- **Choice Field Detection**: Automatically identifies and configures dropdown fields with all unique values
 
----
+### 📝 Markdown Import (Obsidian Compatible)
+- **Bulk Import**: Import entire vaults of markdown files in one operation
+- **Frontmatter Parsing**: Extracts YAML frontmatter as properties
+- **Smart Property Detection**: Analyzes your notes to detect field types automatically
+- **Folder Organization**: Preserves folder structure as a choice field
+- **Wiki-Link Resolution**: Converts `[[Note Name]]` syntax to actual Thymer record references
+- **Obsidian Syntax Support**: Handles callouts, highlights, and other Obsidian-specific markdown
 
-## Limitations & Warnings
-
-This plugin is **functional but still experimental**. Please read this section carefully before importing important data.
-
-### Supported Sources
-- Obsidian vaults are currently the only source that imports *reliably*, including:
-  - Automatic schema generation
-  - Frontmatter → property mapping
-  - Markdown body import
-- Other Markdown-based backups *may* work, but:
-  - Alternative frontmatter schemas have **not been tested**
-  - Behaviour outside standard Obsidian conventions is undefined
-
-### Markdown & Content Support
-- Not all Markdown features can be represented in Thymer yet
-  - Tables are not supported in Thymer and will be lost
-  - Some advanced or non-standard Markdown may not paste cleanly
-  - Links within frontmatter are not created as links in Thymer they will remain in [[wikilink]] format
-- Text files only
-  - Attachments (images, PDFs, etc.) are not imported
-
-### Properties & Frontmatter
-- Thymer does not currently support list/array properties
-  - Frontmatter arrays are converted to comma-separated text
-- Frontmatter must appear at the very start of the file
-  - Inline or mid-document frontmatter is ignored
-- Only properties that appear in more than 5% of files are included in the generated schema (I plan to change this in the next update - it felt like a good idea at the time)
-- If your frontmatter deviates significantly from standard Obsidian usage, manual code tweaks may be required
-
-### Structure & Sync Behaviour
-- Folder hierarchies are not preserved
-  - All notes are imported into a single flat collection
-- This is a manual, one-shot import
-  - There is no continuous or live sync
-- Re-importing updates existing notes, but:
-  - The update process is currently temperamental
-  - In rare cases, notes may be duplicated instead of updated
-
-### Performance
-- Importing is CPU-intensive
-  - On older or lower-powered hardware, expect roughly ~1 minute per 100 files
-  - Large vaults may take significant time and may temporarily freeze the UI
-
-### Safety Warning
-- The importer updates existing records in the target collection
-- Always test in a dedicated test workspace or test collection first
-- Only import into collections created specifically for this plugin
-
----
-
-## What It Does
-
-### Stage 1: Scan
-- Scans your Obsidian vault
-- Generates a note containing:
-  - A suggested collection schema (JSON)
-  - Property mapping details
-  - Setup instructions
-- You then create a Thymer collection using the generated JSON
-
-### Stage 2: Import
-- Imports all Markdown files
-- Maps frontmatter fields to the collection’s properties
-- Runs a second pass to convert Obsidian-style `[[wikilinks]]` into Thymer links  
-  - Note: some links will note be created if you don't import the whole vault at once.
-
----
+### 🎯 One-Click Experience
+- No more two-stage imports
+- No typing collection names - use dropdowns
+- Visual folder selection
+- Real-time progress updates
+- Comprehensive error handling
 
 ## Installation
 
-1. In Thymer, go to **Settings → Plugins**
-2. Click **“+ New Plugin”**
-3. Name it **“Obsidian Import”**
-4. Paste the contents of `plugin.js` from this repository into the **Custom Code** section, replacing all pre-existing code.
-5. Save
-
----
+1. In Thymer, create a new **Global Plugin**
+2. Copy the contents of `unified-import-plugin.js`
+3. Paste into the plugin editor
+4. Save and enable the plugin
 
 ## Usage
 
-⚠️ **Known issue:**
-On both step 1 and 3, when opening up your file manager to select the vault, it can occasionally throw an error and fail to do so. This is almost always resolved by trying a couple of times again. I'm trying to figure out what it is. 
+### CSV Import
 
-### Step 1: Scan Your Vault
+1. Run the **Import Data** command from the command palette
+2. Select **CSV Import**
+3. Choose to create a new collection or select an existing one
+4. Paste CSV data or upload a CSV file
+5. Review and adjust property types
+6. Click **Import**
 
-1. Run the command (Cmd/Ctrl+P): **“Scan Obsidian Vault”**
-2. Enter a name for your vault (e.g. *Personal Notes*)
-3. Select your Obsidian vault folder
-4. Wait for the scan to complete
+#### CSV Type Hints (Optional)
 
-The plugin creates a note in your **Notes** collection (ensure you have a “Notes” collection) containing:
-- A complete collection schema (JSON)
-- Property mapping details
-- Setup instructions
+To skip the property configuration dialog, add type hints as the second row of your CSV:
 
----
-
-### Step 2: Create a Collection
-
-1. Copy the JSON schema from the scan note
-2. In Thymer, click **+** next to *Collections*
-3. Click **“Edit as code”**
-4. Paste the JSON schema into the code box under the **Configuration** tab
-5. Save
-
----
-
-### Step 3: Import Your Vault
-
-1. Run the command: **“Import Obsidian Vault”**
-2. Type the name of the collection you just created
-3. Select your Obsidian vault folder
-  - NOTE: As mentioned above the same bug might require you to do this a couple of times.
-4. Confirm the import
-
-Done! Your notes should now be available in Thymer.
-
----
-
-## Field Mapping
-
-The plugin automatically maps Obsidian frontmatter to Thymer fields.
-
-Example:
-
-```yaml
-created: 2024-01-15          → created (datetime)
-Object Type: Daily Note      → object_type (text)
-walkDog: true               → walkmaia (text)
-tags: [work, urgent]        → tags (text: "work, urgent")
+```csv
+Name,Age,Status,Join Date
+text,number,choice,datetime
+Alice,30,Active,2024-01-15
+Bob,25,Pending,2024-02-20
 ```
 
+Supported types: `text`, `number`, `datetime`, `checkbox`, `choice`, `url`
+
+### Markdown Import
+
+1. Run the **Import Data** command from the command palette
+2. Select **Markdown Import**
+3. Choose to create a new collection or select an existing one
+4. Click to select your markdown folder (e.g., Obsidian vault)
+5. Review detected properties and adjust types as needed
+6. Click **Import**
+
+The plugin will:
+- Scan all `.md` files
+- Analyze frontmatter to detect properties
+- Create the collection with detected schema
+- Import all markdown content
+- Resolve wiki-links to actual record references
+
+#### Example Markdown File
+
+```markdown
+---
+created: 2024-01-15
+status: Active
+tags: [important, work]
 ---
 
-## Re-importing
+# Meeting Notes
 
-To update your vault:
+Discussion about [[Project Alpha]] with the team.
 
-1. Run **“Import Obsidian Vault”** again
-2. Select the same collection
-3. The plugin will attempt to update changed files and skip unchanged ones
+## Action Items
+- [ ] Review the proposal
+- [ ] Schedule follow-up
 
-⚠️ **Known issue:**  
-Re-importing is still unreliable. In some cases, notes may be **duplicated instead of updated**. Until this is fixed, treat re-importing as experimental.
-There is a bug with Thymer opening the file manager where occasionally it fails - I'm looking into that.
+> [!note] Remember
+> This is important context
+```
 
----
+This will create a record with:
+- **Properties**: `created` (datetime), `status` (choice), `tags` (text)
+- **Title**: "Meeting Notes"
+- **Content**: All markdown formatted properly
+- **Links**: `[[Project Alpha]]` becomes a clickable reference
+
+## Property Type Detection
+
+The plugin intelligently detects field types:
+
+| Data Pattern | Detected Type | Notes |
+|-------------|---------------|-------|
+| `2024-01-15` | `datetime` | ISO date format |
+| `true`/`false` | `choice` | Boolean as dropdown |
+| `42` | `number` | Numeric values |
+| Repeated values (2-10 unique) | `choice` | Automatic dropdown |
+| Everything else | `text` | Default fallback |
+
+Common frontmatter fields like `created`, `modified`, `date` are automatically recognized as datetime fields.
+
+## Features in Detail
+
+### Dark/Light Mode Support
+The plugin automatically adapts to Thymer's theme, providing a consistent experience in both dark and light modes.
+
+### Deduplication
+Both CSV and Markdown imports check for existing records by title and update them instead of creating duplicates.
+
+### Batch Processing
+Large imports are processed in batches with progress indicators to prevent UI freezing.
+
+### Error Recovery
+Individual file/row errors don't stop the entire import - the plugin continues and reports what succeeded and what failed.
+
+### Wiki-Link Resolution (Markdown)
+The plugin uses Thymer's segments API to convert wiki-links:
+- `[[Note Name]]` → Searches for a record with that title
+- If found → Creates a clickable record reference
+- If not found → Keeps as plain text
+
+## Collection Schema
+
+### Created Collections Include:
+- **Fields**: All detected properties with appropriate types
+- **Views**: 
+  - Table view for all records
+  - Board view (if folder field exists)
+- **Icons**: Appropriate Tabler icons for each field type
+- **Sorting**: Sensible defaults based on field types
+
+## Tips & Best Practices
+
+### For CSV Import
+- Include headers in the first row
+- Add type hints in the second row to save time
+- Keep choice fields under 50 unique values
+- Use ISO date format (YYYY-MM-DD) for dates
+
+### For Markdown Import
+- Organize files in folders - the plugin creates a folder field automatically
+- Use consistent frontmatter across your notes
+- Common field names (`created`, `modified`, `tags`) are auto-detected
+- Test with a small subset first to verify property types
+
+### Performance
+- CSV: Handles thousands of rows smoothly
+- Markdown: Processes 500+ notes efficiently
+- Progress indicators show status for large imports
 
 ## Troubleshooting
 
-### Empty notes after import?
-- Open the browser console (F12) and check for errors
-- Look for log entries such as:
-  - `[Import] Processing "filename" - Markdown length: X chars`
+### "No markdown content imported"
+- Check that your files have content below the frontmatter
+- Look for console logs showing character counts
+- Verify files are valid markdown (not corrupted)
 
-### Fields showing `[object Object]`?
-- The field type is set to `text` but should be `datetime`
-- Re-scan your vault to generate a corrected schema
-- Create a new collection using the updated schema
-- If the issue persists, report a bug or submit a fix via PR
+### "Collection disappeared after creation"
+- Wait a moment - there's a small sync delay
+- Check the Collections sidebar
+- Try refreshing Thymer
 
-### Properties not mapping?
-- Check the console for messages like:
-  - `[Import] No match for "propertyName"`
-- The plugin attempts multiple naming variations (camelCase, snake_case, etc.)
-- Properties must appear in **more than 5% of files** to be included in the schema
+### "Wiki-links not resolving"
+- Ensure target notes exist in the collection
+- Check that note titles match exactly (case-insensitive)
+- Wiki-links are resolved in Phase 3 (final step)
+
+### "Property types are wrong"
+- You can adjust them in the configuration dialog
+- For CSV: Use type hints in row 2
+- For Markdown: Common date fields are auto-detected
+
+## Technical Details
+
+- **Version**: 1.0.0
+- **Type**: Global Plugin (AppPlugin)
+- **Dependencies**: None (self-contained)
+- **Storage**: Uses Thymer's native file system APIs
+- **API**: Uses Thymer's Collection API and Data API
+
+## Contributing
+
+Found a bug or have a feature request? Please open an issue!
+Even better, PLEASE get involved and improve the plugin. There are lots more apps people will want to migrate from so any help would be greatly appreciated. PRs very welcome.
+
+## Acknowledgments
+
+Special thanks to the Thymer team for the incredible plugin API and all the Thymer community on [Discord](https://discord.gg/7JRKJdnQ)
