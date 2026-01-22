@@ -2,7 +2,6 @@
 
 An import plugin that brings your data into Thymer from multiple sources with a streamlined interface.
 Currently supports CSV & Markdown (specifically trained on Obsidian). 
-Coming soon: Amplenote, Capacities, Logseq & Workflowy
 
 ## Features
 
@@ -29,8 +28,16 @@ Coming soon: Amplenote, Capacities, Logseq & Workflowy
 - Comprehensive error handling
 
 ## Current Limitations
-- **Only pasting CSV content works on Firefox presently. If you want to import a file/directory you will have to use a Chromium based browser.**
-  - I have identified the problem for this but have run out of Claude credit and don't have the skill to fix it without AI. If anyone wants to modify the code to use standard file input with the webkitdirectory attribute and submit a PR, that would be most welcome. 
+- Cannot import attachments
+- Will not render markdown with unsupported equivalent in Thymer, e.g. tables, dividers.
+ 
+## Coming soon: 
+- Google Keep
+- Apple Notes
+- Amplenote
+- Capacities
+- Logseq
+- Workflowy
 
 ## Installation
 
