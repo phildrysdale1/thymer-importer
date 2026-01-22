@@ -132,6 +132,45 @@ class Plugin extends AppPlugin {
     }
 
     // =========================================================================
+    // FIREFOX-COMPATIBLE FOLDER PICKER
+    // =========================================================================
+
+    async pickFolder() {
+        try {
+            if (window.showDirectoryPicker) {
+                return await window.showDirectoryPicker({
+                    mode: 'read',
+                    startIn: 'documents'
+                });
+            }
+
+            // Fallback for browsers without File System Access API (Firefox)
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.webkitdirectory = true;
+            input.multiple = true;
+            input.style.display = 'none';
+            document.body.appendChild(input);
+
+            return await new Promise((resolve) => {
+                input.addEventListener('change', () => {
+                    const files = Array.from(input.files || []);
+                    document.body.removeChild(input);
+                    if (files.length === 0) {
+                        resolve(null);
+                    } else {
+                        resolve({ kind: 'filelist', files });
+                    }
+                }, { once: true });
+                input.click();
+            });
+        } catch (error) {
+            if (error.name === 'AbortError') return null;
+            throw error;
+        }
+    }
+
+    // =========================================================================
     // IMPORT TYPE SELECTION
     // =========================================================================
 
@@ -553,16 +592,16 @@ class Plugin extends AppPlugin {
 
         dialog.querySelector('#select-folder-btn').onclick = async () => {
             try {
-                selectedDirHandle = await window.showDirectoryPicker({
-                    mode: 'read',
-                    startIn: 'documents'
-                });
+                selectedDirHandle = await this.pickFolder();
                 
-                const folderInfo = dialog.querySelector('#folder-info');
-                folderInfo.textContent = `✓ Selected: ${selectedDirHandle.name}`;
-                folderInfo.style.color = this.getThemeColors().success;
-                
-                this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle);
+                if (selectedDirHandle) {
+                    const folderInfo = dialog.querySelector('#folder-info');
+                    const folderName = selectedDirHandle.name || 'Selected folder';
+                    folderInfo.textContent = `✓ Selected: ${folderName}`;
+                    folderInfo.style.color = this.getThemeColors().success;
+                    
+                    this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle);
+                }
             } catch (error) {
                 if (error.name !== 'AbortError') {
                     console.error('[MD Import] Error selecting folder:', error);
@@ -988,7 +1027,7 @@ class Plugin extends AppPlugin {
                     this.showToast(`Importing ${i + 1}/${files.length}`, 500);
                 }
 
-                const fileHandle = await file.handle.getFile();
+                const fileHandle = await this.getFileFromHandle(file.handle);
                 const content = await fileHandle.text();
                 const { frontmatter, markdown } = this.parseMarkdownFile(content);
 
@@ -1565,6 +1604,12 @@ class Plugin extends AppPlugin {
     // =========================================================================
 
     async scanVaultFiles(dirHandle) {
+        // Check if this is a Firefox fallback filelist
+        if (dirHandle && dirHandle.kind === 'filelist') {
+            return await this.scanFileList(dirHandle.files);
+        }
+
+        // Chrome/Edge FileSystemDirectoryHandle
         const files = [];
         const topFolders = new Set();
 
@@ -1580,6 +1625,36 @@ class Plugin extends AppPlugin {
             files, 
             topFolders: Array.from(topFolders).sort() 
         };
+    }
+
+    async scanFileList(fileList) {
+        const files = [];
+        const topFolders = new Set();
+
+        for (const file of fileList) {
+            const relPath = file.webkitRelativePath || file.name;
+            if (!relPath.endsWith('.md')) continue;
+
+            const parts = relPath.split('/');
+            if (parts.some(p => p.startsWith('.')) || 
+                parts.includes('node_modules') || 
+                parts.includes('.obsidian') || 
+                parts.includes('.trash')) {
+                continue;
+            }
+
+            const topFolder = parts[0] || 'Root';
+            topFolders.add(topFolder);
+
+            files.push({
+                handle: file,
+                path: relPath,
+                name: file.name.replace(/\.md$/, ''),
+                topFolder: topFolder || 'Root'
+            });
+        }
+
+        return { files, topFolders: Array.from(topFolders).sort() };
     }
 
     async scanDirectory(dirHandle, path, files, topFolder) {
@@ -1606,6 +1681,17 @@ class Plugin extends AppPlugin {
         }
     }
 
+    async getFileFromHandle(handle) {
+        if (!handle) throw new Error('Missing file handle');
+        if (typeof handle.getFile === 'function') {
+            return await handle.getFile();
+        }
+        if (typeof handle.text === 'function') {
+            return handle; // Already a File
+        }
+        throw new Error('Unsupported file handle type');
+    }
+
     async analyzeFrontmatter(files) {
         const propertyStats = new Map();
         let filesWithFrontmatter = 0;
@@ -1615,7 +1701,7 @@ class Plugin extends AppPlugin {
         for (let i = 0; i < files.length; i += step) {
             const file = files[i];
             try {
-                const fileHandle = await file.handle.getFile();
+                const fileHandle = await this.getFileFromHandle(file.handle);
                 const content = await fileHandle.text();
                 const { frontmatter } = this.parseMarkdownFile(content);
 
