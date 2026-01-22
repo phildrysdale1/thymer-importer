@@ -28,6 +28,10 @@ Coming soon: Amplenote, Capacities, Logseq & Workflowy
 - Real-time progress updates
 - Comprehensive error handling
 
+## Current Limitations
+- **Only pasting CSV content works on Firefox presently. If you want to import a file/directory you will have to use a Chromium based browser.**
+  - I have identified the problem for this but have run out of Claude credit and don't have the skill to fix it without AI. If anyone wants to modify the code to use standard file input with the webkitdirectory attribute and submit a PR, that would be most welcome. 
+
 ## Installation
 
 1. In Thymer, create a new **Global Plugin**
