@@ -12,7 +12,7 @@ Currently supports CSV & Markdown (specifically trained on Obsidian).
 - **Auto-Create Collections**: Creates new collections with proper schemas or imports to existing ones
 - **Choice Field Detection**: Automatically identifies and configures dropdown fields with all unique values
 
-### 📝 Markdown Import (Obsidian Compatible)
+### 📝 Markdown Import for Obsidian (& Logseq MD beta)
 - **Bulk Import**: Import entire vaults of markdown files in one operation
 - **Frontmatter Parsing**: Extracts YAML frontmatter as properties
 - **Smart Property Detection**: Analyzes your notes to detect field types automatically
@@ -36,7 +36,6 @@ Currently supports CSV & Markdown (specifically trained on Obsidian).
 - Apple Notes
 - Amplenote
 - Capacities
-- Logseq
 - Workflowy
 
 ## Installation
@@ -74,10 +73,11 @@ Supported types: `text`, `number`, `datetime`, `checkbox`, `choice`, `url`
 
 1. Run the **Import Data** command from the command palette
 2. Select **Markdown Import**
-3. Choose to create a new collection or select an existing one
-4. Click to select your markdown folder (e.g., Obsidian vault)
-5. Review detected properties and adjust types as needed
-6. Click **Import**
+3. Choose from **Obsidian** or **Logseq**
+4. Choose to create a new collection or select an existing one
+5. Click to select your markdown folder (e.g., Obsidian vault)
+6. Review detected properties and adjust types as needed
+7. Click **Import**
 
 The plugin will:
 - Scan all `.md` files
