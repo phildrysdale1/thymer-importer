@@ -1,8 +1,10 @@
-const VERSION = 'v0.0.4';
+const VERSION = 'v0.0.6';
 /**
  * Unified Import Plugin for Thymer
  * Supports CSV, Obsidian Markdown, and Logseq imports with UI
  * 
+ * v0.0.6 - Added "Import Daily Notes to Journal" command
+ * v0.0.5 - Added "Fix broken [[wikilinks]]" command
  * v0.0.4 - Merged version combining:
  * - CSV import with full UI (from v0.0.3)
  * - Obsidian markdown support (from v0.0.3)  
@@ -12,18 +14,886 @@ const VERSION = 'v0.0.4';
 
 class Plugin extends AppPlugin {
 
-    async onLoad() {
-        console.log('[Unified Import] Plugin loaded - version', VERSION);
-        
-        this.ui.addCommandPaletteCommand({
-            label: 'Import Data (CSV or Markdown)',
-            icon: 'ti-file-import',
-            onSelected: () => this.showImportTypeDialog()
-        });
+    onLoad() {
+        try {
+            console.log('[Unified Import] Plugin loaded - version', VERSION);
+            
+            this.ui.addCommandPaletteCommand({
+                label: 'Import Data (CSV or Markdown)',
+                icon: 'ti-file-import',
+                onSelected: () => this.showImportTypeDialog()
+            });
+
+            this.ui.addCommandPaletteCommand({
+                label: 'Import Daily Notes to Journal',
+                icon: 'ti-calendar',
+                onSelected: () => this.importDailyNotesToJournal()
+            });
+
+            this.ui.addCommandPaletteCommand({
+                label: 'Fix broken [[wikilinks]]',
+                icon: 'ti-link',
+                onSelected: () => this.fixBrokenWikiLinks()
+            });
+        } catch (error) {
+            console.error('[Unified Import] Error in onLoad:', error);
+        }
     }
 
     // =========================================================================
-    // IMPORT TYPE SELECTION DIALOG (from v0.0.3)
+    // IMPORT DAILY NOTES TO JOURNAL
+    // =========================================================================
+
+    async importDailyNotesToJournal() {
+        try {
+            console.log('[Journal Import] Starting daily notes import...');
+            
+            // Find the journal collection using getAllCollections() then isJournalPlugin()
+            const collections = await this.data.getAllCollections();
+            const journalCollection = collections.find(c => c.isJournalPlugin());
+            
+            if (!journalCollection) {
+                this.showToast('Journal not found. Please enable the Journal feature first.', 5000);
+                console.error('[Journal Import] No collection with isJournalPlugin() found');
+                return;
+            }
+
+            console.log('[Journal Import] Found journal collection');
+
+            // Show source selection dialog
+            const source = await this.showJournalSourceDialog();
+            if (!source) return;
+
+            console.log('[Journal Import] Selected source:', source);
+
+            // Show folder picker
+            const dirHandle = await this.pickFolder();
+            if (!dirHandle) return;
+
+            this.showToast('Scanning for daily notes...', 3000);
+
+            // Scan for daily notes based on source
+            const dailyNotes = source === 'logseq'
+                ? await this.scanLogseqDailyNotes(dirHandle)
+                : await this.scanObsidianDailyNotes(dirHandle);
+
+            if (dailyNotes.length === 0) {
+                this.showToast('No daily notes found', 3000);
+                return;
+            }
+
+            console.log(`[Journal Import] Found ${dailyNotes.length} daily notes`);
+
+            // Show confirmation
+            const confirmed = confirm(
+                `Found ${dailyNotes.length} daily notes.\n\n` +
+                `Import to Thymer Journal?\n\n` +
+                `Note: Existing journal entries for the same dates will be updated.`
+            );
+            
+            if (!confirmed) return;
+
+            // Import the daily notes
+            await this.importDailyNotes(journalCollection, dailyNotes, source);
+
+        } catch (error) {
+            console.error('[Journal Import] Error:', error);
+            this.showToast(`Error importing daily notes: ${error.message}`, 5000);
+        }
+    }
+
+    async showJournalSourceDialog() {
+        const colors = this.getThemeColors();
+        
+        return new Promise((resolve) => {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0, 0, 0, 0.5);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 10000;
+            `;
+
+            const dialog = document.createElement('div');
+            dialog.style.cssText = `
+                background: ${colors.background};
+                color: ${colors.text};
+                border-radius: 8px;
+                padding: 32px;
+                width: 90%;
+                max-width: 500px;
+                border: 1px solid ${colors.border};
+            `;
+
+            dialog.innerHTML = `
+                <h2 style="margin: 0 0 24px 0; color: ${colors.text}; text-align: center;">Import Daily Notes</h2>
+                <p style="margin: 0 0 24px 0; color: ${colors.textSecondary}; text-align: center;">
+                    Select the source of your daily notes
+                </p>
+                <div style="display: flex; flex-direction: column; gap: 16px;">
+                    <button id="obsidian-btn" style="
+                        padding: 20px;
+                        background: ${colors.backgroundSecondary};
+                        color: ${colors.text};
+                        border: 2px solid ${colors.border};
+                        border-radius: 8px;
+                        font-size: 16px;
+                        cursor: pointer;
+                        text-align: left;
+                        transition: all 0.2s;
+                    ">
+                        <div style="font-weight: 600; margin-bottom: 4px;">📝 Obsidian Daily Notes</div>
+                        <div style="font-size: 13px; color: ${colors.textSecondary};">
+                            Import from Obsidian daily notes folder
+                        </div>
+                    </button>
+                    <button id="logseq-btn" style="
+                        padding: 20px;
+                        background: ${colors.backgroundSecondary};
+                        color: ${colors.text};
+                        border: 2px solid ${colors.border};
+                        border-radius: 8px;
+                        font-size: 16px;
+                        cursor: pointer;
+                        text-align: left;
+                        transition: all 0.2s;
+                    ">
+                        <div style="font-weight: 600; margin-bottom: 4px;">📓 Logseq Journals</div>
+                        <div style="font-size: 13px; color: ${colors.textSecondary};">
+                            Import from Logseq journals folder
+                        </div>
+                    </button>
+                </div>
+                <div style="margin-top: 24px; text-align: center;">
+                    <button id="cancel-btn" style="
+                        padding: 10px 24px;
+                        background: transparent;
+                        color: ${colors.text};
+                        border: 1px solid ${colors.border};
+                        border-radius: 6px;
+                        cursor: pointer;
+                    ">Cancel</button>
+                </div>
+            `;
+
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+
+            const addHoverEffects = (btn) => {
+                btn.onmouseenter = () => {
+                    btn.style.borderColor = colors.primary;
+                    btn.style.transform = 'translateY(-2px)';
+                };
+                btn.onmouseleave = () => {
+                    btn.style.borderColor = colors.border;
+                    btn.style.transform = 'translateY(0)';
+                };
+            };
+
+            addHoverEffects(dialog.querySelector('#obsidian-btn'));
+            addHoverEffects(dialog.querySelector('#logseq-btn'));
+
+            dialog.querySelector('#obsidian-btn').onclick = () => {
+                document.body.removeChild(overlay);
+                resolve('obsidian');
+            };
+
+            dialog.querySelector('#logseq-btn').onclick = () => {
+                document.body.removeChild(overlay);
+                resolve('logseq');
+            };
+
+            dialog.querySelector('#cancel-btn').onclick = () => {
+                document.body.removeChild(overlay);
+                resolve(null);
+            };
+
+            overlay.onclick = (e) => {
+                if (e.target === overlay) {
+                    document.body.removeChild(overlay);
+                    resolve(null);
+                }
+            };
+        });
+    }
+
+    async pickFolder() {
+        try {
+            if (window.showDirectoryPicker) {
+                return await window.showDirectoryPicker({
+                    mode: 'read',
+                    startIn: 'documents'
+                });
+            }
+
+            // Fallback for browsers without File System Access API
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.webkitdirectory = true;
+            input.multiple = true;
+            input.style.display = 'none';
+            document.body.appendChild(input);
+
+            return await new Promise((resolve) => {
+                input.addEventListener('change', () => {
+                    const files = Array.from(input.files || []);
+                    document.body.removeChild(input);
+                    if (files.length === 0) {
+                        resolve(null);
+                    } else {
+                        resolve({ kind: 'filelist', files });
+                    }
+                }, { once: true });
+                input.click();
+            });
+        } catch (error) {
+            if (error.name === 'AbortError') return null;
+            throw error;
+        }
+    }
+
+    async scanObsidianDailyNotes(dirHandle) {
+        const dailyNotes = [];
+        
+        if (dirHandle && dirHandle.kind === 'filelist') {
+            // Handle file list from fallback
+            for (const file of dirHandle.files) {
+                const relPath = file.webkitRelativePath || file.name;
+                if (!relPath.endsWith('.md')) continue;
+
+                const filename = file.name.replace(/\.md$/, '');
+                const date = this.parseObsidianDateFromFilename(filename);
+                
+                if (date) {
+                    dailyNotes.push({
+                        handle: file,
+                        path: relPath,
+                        filename: filename,
+                        date: date
+                    });
+                }
+            }
+        } else {
+            // Handle directory picker
+            await this.scanObsidianDirectory(dirHandle, '', dailyNotes);
+        }
+
+        return dailyNotes.sort((a, b) => a.date.localeCompare(b.date));
+    }
+
+    async scanObsidianDirectory(dirHandle, path, dailyNotes) {
+        for await (const entry of dirHandle.values()) {
+            const fullPath = path ? `${path}/${entry.name}` : entry.name;
+
+            if (entry.kind === 'directory') {
+                if (entry.name.startsWith('.') || entry.name === 'node_modules') {
+                    continue;
+                }
+                await this.scanObsidianDirectory(entry, fullPath, dailyNotes);
+            } else if (entry.kind === 'file' && entry.name.endsWith('.md')) {
+                const filename = entry.name.replace(/\.md$/, '');
+                const date = this.parseObsidianDateFromFilename(filename);
+                
+                if (date) {
+                    dailyNotes.push({
+                        handle: entry,
+                        path: fullPath,
+                        filename: filename,
+                        date: date
+                    });
+                }
+            }
+        }
+    }
+
+    parseObsidianDateFromFilename(filename) {
+        // Common Obsidian daily note formats:
+        // YYYY-MM-DD (most common)
+        // YYYYMMDD
+        // DD-MM-YYYY
+        // MM-DD-YYYY
+        
+        // Try YYYY-MM-DD format
+        let match = filename.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (match) {
+            return `${match[1]}-${match[2]}-${match[3]}`;
+        }
+        
+        // Try YYYYMMDD format
+        match = filename.match(/^(\d{4})(\d{2})(\d{2})$/);
+        if (match) {
+            return `${match[1]}-${match[2]}-${match[3]}`;
+        }
+        
+        // Try DD-MM-YYYY format
+        match = filename.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+        if (match) {
+            return `${match[3]}-${match[2]}-${match[1]}`;
+        }
+        
+        // Try MM-DD-YYYY format
+        match = filename.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+        if (match) {
+            // Ambiguous - could be DD-MM or MM-DD
+            // Default to MM-DD (US format) if day > 12
+            const first = parseInt(match[1]);
+            const second = parseInt(match[2]);
+            if (first > 12) {
+                // Must be DD-MM
+                return `${match[3]}-${match[2]}-${match[1]}`;
+            }
+            // Assume MM-DD
+            return `${match[3]}-${match[1]}-${match[2]}`;
+        }
+        
+        return null;
+    }
+
+    async scanLogseqDailyNotes(dirHandle) {
+        const dailyNotes = [];
+        
+        if (dirHandle && dirHandle.kind === 'filelist') {
+            // Handle file list from fallback
+            for (const file of dirHandle.files) {
+                const relPath = file.webkitRelativePath || file.name;
+                if (!relPath.endsWith('.md')) continue;
+
+                // Check if in journals folder
+                const parts = relPath.split('/');
+                if (parts.length === 0) continue;
+                
+                const topFolder = parts[0];
+                if (topFolder !== 'journals') continue;
+
+                const filename = file.name.replace(/\.md$/, '');
+                const date = this.parseLogseqDateFromFilename(filename);
+                
+                if (date) {
+                    dailyNotes.push({
+                        handle: file,
+                        path: relPath,
+                        filename: filename,
+                        date: date
+                    });
+                }
+            }
+        } else {
+            // Handle directory picker - look for journals folder
+            for await (const entry of dirHandle.values()) {
+                if (entry.kind === 'directory' && entry.name === 'journals') {
+                    await this.scanLogseqJournalsDirectory(entry, dailyNotes);
+                    break;
+                }
+            }
+        }
+
+        return dailyNotes.sort((a, b) => a.date.localeCompare(b.date));
+    }
+
+    async scanLogseqJournalsDirectory(dirHandle, dailyNotes) {
+        for await (const entry of dirHandle.values()) {
+            if (entry.kind === 'file' && entry.name.endsWith('.md')) {
+                const filename = entry.name.replace(/\.md$/, '');
+                const date = this.parseLogseqDateFromFilename(filename);
+                
+                if (date) {
+                    dailyNotes.push({
+                        handle: entry,
+                        path: `journals/${entry.name}`,
+                        filename: filename,
+                        date: date
+                    });
+                }
+            }
+        }
+    }
+
+    parseLogseqDateFromFilename(filename) {
+        // Logseq format: YYYY_MM_DD
+        const match = filename.match(/^(\d{4})_(\d{2})_(\d{2})$/);
+        if (match) {
+            return `${match[1]}-${match[2]}-${match[3]}`;
+        }
+        
+        return null;
+    }
+
+    async importDailyNotes(journalPlugin, dailyNotes, source) {
+        let imported = 0;
+        let updated = 0;
+        let errors = 0;
+
+        console.log(`[Journal Import] Importing ${dailyNotes.length} daily notes`);
+        this.showToast(`Importing ${dailyNotes.length} daily notes...`, 3000);
+
+        for (let i = 0; i < dailyNotes.length; i++) {
+            const note = dailyNotes[i];
+
+            try {
+                if (i % 5 === 0) {
+                    this.showToast(`Importing ${i + 1}/${dailyNotes.length}`, 500);
+                }
+
+                console.log(`[Journal Import] Processing: ${note.filename} (${note.date})`);
+
+                // Read the file content
+                const fileHandle = await this.getFileFromHandle(note.handle);
+                const content = await fileHandle.text();
+
+                // Parse the markdown
+                const parsed = source === 'logseq'
+                    ? this.parseLogseqFile(content)
+                    : this.parseMarkdownFile(content);
+
+                // Parse the date into components
+                const [year, month, day] = note.date.split('-').map(n => parseInt(n));
+
+                // Get the current user
+                const users = this.data.getActiveUsers();
+                const currentUser = users[0]; // Get the first active user (current user)
+                
+                if (!currentUser) {
+                    console.error(`[Journal Import] No active user found`);
+                    errors++;
+                    continue;
+                }
+
+                // Create a DateTime object for the date (date-only, no time component)
+                // month is 0-indexed in JavaScript Date
+                const dateTime = DateTime.dateOnly(year, month - 1, day);
+
+                // Get or create journal record for this date
+                const journalRecord = await journalPlugin.getJournalRecord(currentUser, dateTime);
+                
+                if (!journalRecord) {
+                    console.error(`[Journal Import] Failed to get/create journal record for ${note.date}`);
+                    errors++;
+                    continue;
+                }
+
+                // Check if this is a new record or existing
+                const lineItems = await journalRecord.getLineItems();
+                const isNew = !lineItems || lineItems.length === 0;
+
+                if (isNew) {
+                    console.log(`[Journal Import] Creating new journal entry for ${note.date}`);
+                    imported++;
+                } else {
+                    console.log(`[Journal Import] Updating existing journal entry for ${note.date}`);
+                    updated++;
+                }
+
+                // Clear existing content if updating
+                if (!isNew) {
+                    const textProp = journalRecord.prop('text');
+                    if (textProp) textProp.set('');
+                }
+
+                // Wait for record to be ready
+                await new Promise(resolve => setTimeout(resolve, 300));
+
+                // Insert the markdown content
+                if (parsed.markdown) {
+                    const convertedMarkdown = this.convertMarkdown(parsed.markdown, source);
+                    try {
+                        await this.insertMarkdown(convertedMarkdown, journalRecord, null);
+                        console.log(`[Journal Import] ✓ Successfully imported ${note.filename}`);
+                    } catch (error) {
+                        console.error(`[Journal Import] insertMarkdown failed for ${note.filename}:`, error);
+                        errors++;
+                    }
+                } else {
+                    console.log(`[Journal Import] No markdown content for ${note.filename}`);
+                }
+
+            } catch (error) {
+                console.error(`[Journal Import] Error processing ${note.filename}:`, error);
+                errors++;
+            }
+        }
+
+        this.showToast(
+            `Journal import complete!\n` +
+            `New entries: ${imported}\n` +
+            `Updated: ${updated}\n` +
+            `Errors: ${errors}`,
+            8000
+        );
+
+        console.log(`[Journal Import] Complete: ${imported} imported, ${updated} updated, ${errors} errors`);
+    }
+
+    // =========================================================================
+    // FIX BROKEN WIKILINKS COMMAND
+    // =========================================================================
+
+    async fixBrokenWikiLinks() {
+        try {
+            console.log('[Fix Links] Starting wikilink repair scan...');
+            this.showToast('Scanning workspace for broken wikilinks...', 3000);
+
+            // Get all collections
+            const collections = await this.data.getAllCollections();
+            
+            // Build a workspace-wide name→record map
+            const nameToRecords = new Map(); // name → array of {record, collection}
+            const guidToRecord = new Map();   // guid → {record, collection}
+            
+            console.log('[Fix Links] Building workspace lookup map...');
+            for (const collection of collections) {
+                const records = await collection.getAllRecords();
+                for (const record of records) {
+                    const name = record.getName();
+                    if (name) {
+                        const key = name.toLowerCase();
+                        if (!nameToRecords.has(key)) {
+                            nameToRecords.set(key, []);
+                        }
+                        nameToRecords.get(key).push({ record, collection });
+                        guidToRecord.set(record.guid, { record, collection });
+                    }
+                }
+            }
+            
+            console.log(`[Fix Links] Found ${nameToRecords.size} unique record names across ${collections.length} collections`);
+
+            // Scan all records for broken wikilinks
+            let totalLineItems = 0;
+            let lineItemsWithLinks = 0;
+            let brokenLinksFound = 0;
+            const fixableLinks = []; // {record, collection, lineItem, lineIndex, linkText, candidates}
+
+            for (const collection of collections) {
+                const records = await collection.getAllRecords();
+                
+                for (const record of records) {
+                    const lineItems = await record.getLineItems();
+                    if (!lineItems || lineItems.length === 0) continue;
+
+                    for (let i = 0; i < lineItems.length; i++) {
+                        const lineItem = lineItems[i];
+                        totalLineItems++;
+                        
+                        const segments = lineItem.segments || [];
+                        if (segments.length === 0) continue;
+
+                        // Check if this line contains [[...]] or ((...)) in text segments
+                        // Exclude code blocks and inline code
+                        let hasUnresolvedLinks = false;
+                        const unresolvedLinks = [];
+                        
+                        for (const segment of segments) {
+                            // Skip code segments (inline code)
+                            if (segment.type === 'code') continue;
+                            
+                            // Only check text segments
+                            if (segment.type === 'text' && segment.text) {
+                                // Look for [[...]] or ((...)) patterns
+                                const linkRegex = /(\[\[([^\]]+)\]\]|\(\(([^\)]+)\)\))/g;
+                                let match;
+                                
+                                while ((match = linkRegex.exec(segment.text)) !== null) {
+                                    hasUnresolvedLinks = true;
+                                    const linkText = match[2] || match[3];
+                                    unresolvedLinks.push(linkText.trim());
+                                }
+                            }
+                        }
+
+                        if (hasUnresolvedLinks) {
+                            lineItemsWithLinks++;
+                            
+                            // For each unresolved link, find potential matches
+                            for (const linkText of unresolvedLinks) {
+                                brokenLinksFound++;
+                                const key = linkText.toLowerCase();
+                                const candidates = nameToRecords.get(key) || [];
+                                
+                                if (candidates.length > 0) {
+                                    fixableLinks.push({
+                                        record,
+                                        collection,
+                                        lineItem,
+                                        lineIndex: i,
+                                        linkText,
+                                        candidates
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            console.log(`[Fix Links] Scan complete: ${totalLineItems} line items, ${lineItemsWithLinks} with wikilinks, ${brokenLinksFound} broken links found`);
+
+            if (fixableLinks.length === 0) {
+                this.showToast('No fixable broken wikilinks found!', 5000);
+                return;
+            }
+
+            // Process fixable links - show dialog for each with multiple candidates
+            console.log(`[Fix Links] Processing ${fixableLinks.length} fixable links...`);
+            await this.processFixableLinks(fixableLinks, nameToRecords);
+
+        } catch (error) {
+            console.error('[Fix Links] Error:', error);
+            this.showToast(`Error fixing wikilinks: ${error.message}`, 5000);
+        }
+    }
+
+    async processFixableLinks(fixableLinks, nameToRecords) {
+        let fixed = 0;
+        let skipped = 0;
+        
+        // Group by record to batch updates
+        const linksByRecord = new Map();
+        for (const link of fixableLinks) {
+            const recordKey = `${link.collection.getGuid()}_${link.record.guid}`;
+            if (!linksByRecord.has(recordKey)) {
+                linksByRecord.set(recordKey, []);
+            }
+            linksByRecord.get(recordKey).push(link);
+        }
+
+        console.log(`[Fix Links] Processing ${linksByRecord.size} records with broken links...`);
+
+        for (const [recordKey, links] of linksByRecord.entries()) {
+            const record = links[0].record;
+            const collection = links[0].collection;
+            
+            console.log(`[Fix Links] Processing record: ${record.getName()} with ${links.length} broken links`);
+
+            // Build a map of line index to link fixes
+            const fixesByLine = new Map();
+            
+            for (const link of links) {
+                if (link.candidates.length === 1) {
+                    // Single match - auto-fix
+                    if (!fixesByLine.has(link.lineIndex)) {
+                        fixesByLine.set(link.lineIndex, []);
+                    }
+                    fixesByLine.get(link.lineIndex).push({
+                        linkText: link.linkText,
+                        targetRecord: link.candidates[0].record
+                    });
+                    fixed++;
+                } else {
+                    // Multiple matches - ask user
+                    const choice = await this.showLinkChoiceDialog(
+                        link.linkText,
+                        link.candidates,
+                        record.getName()
+                    );
+                    
+                    if (choice) {
+                        if (!fixesByLine.has(link.lineIndex)) {
+                            fixesByLine.set(link.lineIndex, []);
+                        }
+                        fixesByLine.get(link.lineIndex).push({
+                            linkText: link.linkText,
+                            targetRecord: choice.record
+                        });
+                        fixed++;
+                    } else {
+                        skipped++;
+                    }
+                }
+            }
+
+            // Apply all fixes for this record
+            if (fixesByLine.size > 0) {
+                await this.applyLinkFixes(record, fixesByLine);
+            }
+        }
+
+        this.showToast(`Fixed ${fixed} wikilinks, skipped ${skipped}`, 5000);
+    }
+
+    async showLinkChoiceDialog(linkText, candidates, recordName) {
+        const colors = this.getThemeColors();
+        
+        return new Promise((resolve) => {
+            const overlay = document.createElement('div');
+            overlay.style.cssText = `
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background: rgba(0, 0, 0, 0.5);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                z-index: 10001;
+            `;
+
+            const dialog = document.createElement('div');
+            dialog.style.cssText = `
+                background: ${colors.background};
+                color: ${colors.text};
+                border: 1px solid ${colors.border};
+                border-radius: 8px;
+                padding: 24px;
+                width: 90%;
+                max-width: 600px;
+                max-height: 80vh;
+                overflow-y: auto;
+            `;
+
+            const candidateOptions = candidates.map((c, idx) => {
+                const collectionName = c.collection.getName();
+                return `
+                    <div style="
+                        padding: 12px;
+                        margin: 8px 0;
+                        border: 2px solid ${colors.border};
+                        border-radius: 6px;
+                        cursor: pointer;
+                        transition: all 0.2s;
+                        background: ${colors.backgroundSecondary};
+                    " class="link-option" data-index="${idx}">
+                        <div style="font-weight: 600; margin-bottom: 4px;">${this.escapeHtml(c.record.getName())}</div>
+                        <div style="font-size: 12px; color: ${colors.textSecondary};">Collection: ${this.escapeHtml(collectionName)}</div>
+                    </div>
+                `;
+            }).join('');
+
+            dialog.innerHTML = `
+                <h2 style="margin: 0 0 16px 0; color: ${colors.text};">Choose Link Target</h2>
+                <p style="margin: 0 0 16px 0; color: ${colors.textSecondary};">
+                    Multiple records found for <strong>[[${this.escapeHtml(linkText)}]]</strong> in <em>${this.escapeHtml(recordName)}</em>
+                </p>
+                <div id="candidate-options">
+                    ${candidateOptions}
+                </div>
+                <div style="margin-top: 24px; display: flex; gap: 8px; justify-content: flex-end;">
+                    <button id="skip-btn" style="
+                        padding: 8px 16px;
+                        border: 1px solid ${colors.buttonBorder};
+                        background: ${colors.buttonBg};
+                        color: ${colors.buttonText};
+                        border-radius: 4px;
+                        cursor: pointer;
+                    ">Skip</button>
+                </div>
+            `;
+
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+
+            // Add hover effects to options
+            const options = dialog.querySelectorAll('.link-option');
+            options.forEach(option => {
+                option.addEventListener('mouseenter', () => {
+                    option.style.borderColor = colors.primary;
+                    option.style.transform = 'translateX(4px)';
+                });
+                option.addEventListener('mouseleave', () => {
+                    option.style.borderColor = colors.border;
+                    option.style.transform = 'translateX(0)';
+                });
+                option.addEventListener('click', () => {
+                    const idx = parseInt(option.getAttribute('data-index'));
+                    document.body.removeChild(overlay);
+                    resolve(candidates[idx]);
+                });
+            });
+
+            dialog.querySelector('#skip-btn').onclick = () => {
+                document.body.removeChild(overlay);
+                resolve(null);
+            };
+
+            overlay.onclick = (e) => {
+                if (e.target === overlay) {
+                    document.body.removeChild(overlay);
+                    resolve(null);
+                }
+            };
+        });
+    }
+
+    async applyLinkFixes(record, fixesByLine) {
+        const lineItems = await record.getLineItems();
+        
+        for (const [lineIndex, fixes] of fixesByLine.entries()) {
+            const lineItem = lineItems[lineIndex];
+            if (!lineItem) continue;
+
+            const segments = lineItem.segments || [];
+            if (segments.length === 0) continue;
+
+            const newSegments = [];
+            
+            for (const segment of segments) {
+                if (segment.type === 'text' && segment.text) {
+                    // Replace [[linkText]] and ((linkText)) with refs
+                    let lastIndex = 0;
+                    
+                    // Build a regex that matches any of the link texts
+                    const linkTexts = fixes.map(f => f.linkText);
+                    const escapedTexts = linkTexts.map(text => 
+                        text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                    );
+                    const pattern = `(\\[\\[(${escapedTexts.join('|')})\\]\\]|\\(\\((${escapedTexts.join('|')})\\)\\))`;
+                    const linkRegex = new RegExp(pattern, 'g');
+                    
+                    let match;
+                    while ((match = linkRegex.exec(segment.text)) !== null) {
+                        const linkText = match[2] || match[3];
+                        const fix = fixes.find(f => f.linkText === linkText);
+                        
+                        if (fix) {
+                            // Add text before the link
+                            if (match.index > lastIndex) {
+                                newSegments.push({
+                                    type: 'text',
+                                    text: segment.text.substring(lastIndex, match.index)
+                                });
+                            }
+                            
+                            // Add ref segment
+                            newSegments.push({
+                                type: 'ref',
+                                text: fix.targetRecord.guid
+                            });
+                            
+                            lastIndex = match.index + match[0].length;
+                        }
+                    }
+                    
+                    // Add remaining text
+                    if (lastIndex < segment.text.length) {
+                        newSegments.push({
+                            type: 'text',
+                            text: segment.text.substring(lastIndex)
+                        });
+                    }
+                } else {
+                    // Keep non-text segments as-is
+                    newSegments.push(segment);
+                }
+            }
+            
+            // Update the line item with fixed segments
+            try {
+                await lineItem.setSegments(newSegments);
+                console.log(`[Fix Links] Updated line ${lineIndex} with ${fixes.length} fixes`);
+            } catch (error) {
+                console.error(`[Fix Links] Error updating line ${lineIndex}:`, error);
+            }
+        }
+    }
+
+    // =========================================================================
+    // IMPORT TYPE SELECTION DIALOG
     // =========================================================================
 
     showImportTypeDialog() {
@@ -121,12 +991,12 @@ class Plugin extends AppPlugin {
 
         dialog.querySelector('#csv-import-btn').onclick = () => {
             document.body.removeChild(overlay);
-            this.showCSVImportDialog(); // Actually show CSV import!
+            this.showCSVImportDialog();
         };
 
         dialog.querySelector('#markdown-import-btn').onclick = () => {
             document.body.removeChild(overlay);
-            this.showMarkdownImportDialog(); // Show full markdown import dialog
+            this.showMarkdownImportDialog();
         };
 
         dialog.querySelector('#cancel-btn').onclick = () => {
@@ -140,8 +1010,8 @@ class Plugin extends AppPlugin {
         };
     }
 
-    // =========================================================================
-    // CSV IMPORT (Complete implementation from v0.0.3)
+    // ========================================================================
+    // CSV IMPORT (Complete implementation)
     // =========================================================================
 
     showCSVImportDialog() {
@@ -629,7 +1499,6 @@ class Plugin extends AppPlugin {
         const recordGuid = collection.createRecord(title);
         if (!recordGuid) return null;
 
-        // Use retry logic like in markdown import
         let record = null;
         for (let attempt = 0; attempt < 5; attempt++) {
             await new Promise(resolve => setTimeout(resolve, 100 + (attempt * 50)));
@@ -659,7 +1528,6 @@ class Plugin extends AppPlugin {
                     continue;
                 }
 
-                // DateTime fields
                 if (fieldType === 'datetime' && typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) {
                     try {
                         const dateOnly = value.match(/^\d{4}-\d{2}-\d{2}/)[0];
@@ -669,22 +1537,18 @@ class Plugin extends AppPlugin {
                         prop.set(value);
                     }
                 }
-                // Number fields
                 else if (fieldType === 'number') {
                     const num = this.coerceNumber(value);
                     if (num !== null) {
                         prop.set(num);
                     }
                 }
-                // Checkbox fields
                 else if (fieldType === 'checkbox') {
                     prop.set(this.coerceBoolean(value));
                 }
-                // Choice fields
                 else if (fieldType === 'choice' && typeof prop.setChoice === 'function') {
                     prop.setChoice(String(value).trim());
                 }
-                // Default: text
                 else {
                     prop.set(value);
                 }
@@ -910,7 +1774,7 @@ class Plugin extends AppPlugin {
     }
 
     // =========================================================================
-    // MARKDOWN IMPORT DIALOG (Enhanced from v0.0.3)
+    // MARKDOWN IMPORT DIALOG
     // =========================================================================
 
     showMarkdownImportDialog() {
@@ -1006,7 +1870,6 @@ class Plugin extends AppPlugin {
             this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle);
         });
 
-        // Folder selection button - maintains user gesture!
         dialog.querySelector('#select-folder-btn').onclick = async () => {
             try {
                 selectedDirHandle = await window.showDirectoryPicker({
@@ -1091,7 +1954,6 @@ class Plugin extends AppPlugin {
         this.showStatus(statusDiv, 'Scanning files...', 'info');
 
         try {
-            // Phase 1: Scan files based on source
             const scanResults = source === 'logseq' 
                 ? await this.scanLogseqFiles(dirHandle)
                 : await this.scanVaultFiles(dirHandle);
@@ -1105,7 +1967,6 @@ class Plugin extends AppPlugin {
 
             this.showStatus(statusDiv, `Analyzing ${scanResults.files.length} files...`, 'info');
             
-            // Phase 2: Analyze based on source
             const analysis = source === 'logseq'
                 ? await this.analyzeLogseqProperties(scanResults.files)
                 : await this.analyzeFrontmatter(scanResults.files);
@@ -1128,11 +1989,9 @@ class Plugin extends AppPlugin {
                 }
             }
 
-            // Phase 3: Import all files
             this.showStatus(statusDiv, 'Importing files...', 'info');
             const importResult = await this.executeImport(collection, scanResults.files, source, statusDiv);
 
-            // Phase 4: Resolve wiki-links
             this.showStatus(statusDiv, 'Resolving links...', 'info');
             await this.resolveWikiLinksWithSegments(collection, source, statusDiv);
 
@@ -1158,12 +2017,9 @@ class Plugin extends AppPlugin {
             throw new Error('Failed to create collection');
         }
 
-        console.log('[MD Import] Collection created, GUID:', newCollection.getGuid());
-
         const config = newCollection.getConfiguration();
         const fields = [];
 
-        // Add folder field if we have folders
         if (topFolders.length > 0) {
             const folderChoices = topFolders.map((folder, i) => ({
                 id: this.slugify(folder) || `folder_${i}`,
@@ -1184,7 +2040,6 @@ class Plugin extends AppPlugin {
             });
         }
 
-        // Add source_path field
         fields.push({
             id: 'source_path',
             label: 'Source Path',
@@ -1195,7 +2050,6 @@ class Plugin extends AppPlugin {
             active: true
         });
 
-        // Add analyzed properties
         for (const prop of properties) {
             const fieldId = this.slugify(prop.key);
             if (!fieldId || fields.find(f => f.id === fieldId)) continue;
@@ -1292,7 +2146,7 @@ class Plugin extends AppPlugin {
     }
 
     // =========================================================================
-    // THEME UTILITIES (Enhanced from v0.0.3)
+    // THEME UTILITIES
     // =========================================================================
 
     isDarkMode() {
@@ -1370,109 +2224,11 @@ class Plugin extends AppPlugin {
         }
     }
 
-
-
     // =========================================================================
-    // SCAN COMMAND
+    // VAULT SCANNING & ANALYSIS (for Obsidian/Logseq)
     // =========================================================================
-
-    async scanVault() {
-        try {
-            const source = this.chooseSource();
-            if (!source) return;
-
-            const sourceLabel = source === 'logseq' ? 'Logseq' : 'Obsidian';
-            const vaultName = prompt(`Enter ${sourceLabel} vault name (e.g., "Personal Notes"):`); 
-            if (!vaultName) return;
-
-            const dirHandle = await this.pickFolder();
-            if (!dirHandle) return;
-
-            this.showToast('Scanning vault...', 3000);
-            const scanResults = source === 'logseq' 
-                ? await this.scanLogseqFiles(dirHandle)
-                : await this.scanVaultFiles(dirHandle);
-
-            if (scanResults.files.length === 0) {
-                this.showToast('No .md files found', 3000);
-                return;
-            }
-
-            this.showToast(`Analyzing ${scanResults.files.length} files...`, 5000);
-            const analysis = source === 'logseq'
-                ? await this.analyzeLogseqProperties(scanResults.files)
-                : await this.analyzeFrontmatter(scanResults.files);
-            
-            await this.createScanNote(vaultName, scanResults, analysis, source);
-            this.showToast('Scan complete! Check Notes collection', 5000);
-
-        } catch (error) {
-            console.error('[Scan] Error:', error);
-            this.showToast(`Scan failed: ${error.message}`, 5000);
-        }
-    }
-
-    chooseSource() {
-        const choice = prompt(
-            'Select import source:\n' +
-            '1) Obsidian (default)\n' +
-            '2) Logseq\n\n' +
-            'Enter 1 or 2 (or leave blank for Obsidian):'
-        );
-        if (choice === null) return null;
-
-        const normalized = (choice || '').trim().toLowerCase();
-        if (!normalized || normalized === '1' || normalized.startsWith('o')) {
-            return 'obsidian';
-        }
-        if (normalized === '2' || normalized.startsWith('l')) {
-            return 'logseq';
-        }
-
-        this.showToast('Invalid choice', 2000);
-        return null;
-    }
-
-    async pickFolder() {
-        try {
-            if (window.showDirectoryPicker) {
-                return await window.showDirectoryPicker({
-                    mode: 'read',
-                    startIn: 'documents'
-                });
-            }
-
-            // Fallback for browsers without File System Access API
-            const input = document.createElement('input');
-            input.type = 'file';
-            input.webkitdirectory = true;
-            input.multiple = true;
-            input.style.display = 'none';
-            document.body.appendChild(input);
-
-            return await new Promise((resolve) => {
-                input.addEventListener('change', () => {
-                    const files = Array.from(input.files || []);
-                    document.body.removeChild(input);
-                    if (files.length === 0) {
-                        resolve(null);
-                    } else {
-                        resolve({ kind: 'filelist', files });
-                    }
-                }, { once: true });
-                input.click();
-            });
-        } catch (error) {
-            if (error.name === 'AbortError') return null;
-            throw error;
-        }
-    }
 
     async scanVaultFiles(dirHandle) {
-        if (dirHandle && dirHandle.kind === 'filelist') {
-            return await this.scanFileList(dirHandle.files);
-        }
-
         const files = [];
         const topFolders = new Set();
 
@@ -1491,10 +2247,6 @@ class Plugin extends AppPlugin {
     }
 
     async scanLogseqFiles(dirHandle) {
-        if (dirHandle && dirHandle.kind === 'filelist') {
-            return await this.scanLogseqFileList(dirHandle.files);
-        }
-
         const files = [];
         const allowedTop = new Set(['pages', 'journals']);
         const presentTop = new Set();
@@ -1530,63 +2282,6 @@ class Plugin extends AppPlugin {
                 });
             }
         }
-    }
-
-    async scanFileList(fileList) {
-        const files = [];
-        const topFolders = new Set();
-
-        for (const file of fileList) {
-            const relPath = file.webkitRelativePath || file.name;
-            if (!relPath.endsWith('.md')) continue;
-
-            const parts = relPath.split('/');
-            if (parts.some(p => p.startsWith('.')) || parts.includes('node_modules') || parts.includes('.obsidian') || parts.includes('.trash')) {
-                continue;
-            }
-
-            const topFolder = parts[0] || 'Root';
-            topFolders.add(topFolder);
-
-            files.push({
-                handle: file,
-                path: relPath,
-                name: file.name.replace(/\.md$/, ''),
-                topFolder: topFolder || 'Root'
-            });
-        }
-
-        return { files, topFolders: Array.from(topFolders).sort() };
-    }
-
-    async scanLogseqFileList(fileList) {
-        const files = [];
-        const allowedTop = new Set(['pages', 'journals']);
-        const presentTop = new Set();
-
-        for (const file of fileList) {
-            const relPath = file.webkitRelativePath || file.name;
-            if (!relPath.endsWith('.md')) continue;
-
-            const parts = relPath.split('/');
-            if (parts.length === 0) continue;
-            if (parts.some(p => p.startsWith('.')) || parts.includes('node_modules') || parts.includes('.obsidian') || parts.includes('.trash')) {
-                continue;
-            }
-
-            const topFolder = parts[0];
-            if (!allowedTop.has(topFolder)) continue;
-            presentTop.add(topFolder);
-
-            files.push({
-                handle: file,
-                path: relPath,
-                name: file.name.replace(/\.md$/, ''),
-                topFolder
-            });
-        }
-
-        return { files, topFolders: Array.from(presentTop).sort() };
     }
 
     async scanDirectory(dirHandle, path, files, topFolder) {
@@ -1747,13 +2442,11 @@ class Plugin extends AppPlugin {
             return { type: 'datetime', note: 'Date field' };
         }
         
-        // Check if samples contain date-like strings
         if (typeArray.includes('string')) {
             const dateCount = samples.filter(s => 
                 typeof s === 'string' && /^\d{4}-\d{2}-\d{2}/.test(s)
             ).length;
             
-            // If more than 50% of samples look like dates, treat as datetime
             if (dateCount > samples.length * 0.5) {
                 return { type: 'datetime', note: 'Date field (from samples)' };
             }
@@ -1817,12 +2510,10 @@ class Plugin extends AppPlugin {
                 const rawValue = propMatch[3].trim();
                 const parsedValue = this.parseLogseqValue(rawValue);
 
-                // Treat top-level properties as page-level metadata
                 if (indent <= 1 && frontmatter[key] === undefined) {
                     frontmatter[key] = parsedValue;
                 }
 
-                // Track block ids for ref resolution
                 if (key.toLowerCase() === 'id' && rawValue) {
                     const idValue = rawValue.split(/\s+/)[0].trim();
                     if (idValue) blockIds.add(idValue);
@@ -1857,7 +2548,7 @@ class Plugin extends AppPlugin {
             return await handle.getFile();
         }
         if (typeof handle.text === 'function') {
-            return handle; // Already a File
+            return handle;
         }
         throw new Error('Unsupported file handle type');
     }
@@ -1923,383 +2614,9 @@ class Plugin extends AppPlugin {
         return result;
     }
 
-    async createScanNote(vaultName, scanResults, analysis, source = 'obsidian') {
-        const collections = await this.data.getAllCollections();
-        const notesCollection = collections.find(c => c.getName() === 'Notes');
-        
-        if (!notesCollection) {
-            throw new Error('Notes collection not found');
-        }
-
-        const schema = this.generateSchema(vaultName, scanResults.topFolders, analysis.properties, source);
-        const schemaJson = JSON.stringify(schema, null, 2);
-        const noteContent = this.generateReport(vaultName, scanResults, analysis, schemaJson, source);
-        const sourceLabel = source === 'logseq' ? 'Logseq' : 'Obsidian';
-
-        const recordGuid = notesCollection.createRecord(`${sourceLabel} Scan: ${vaultName}`);
-        if (!recordGuid) throw new Error('Failed to create note');
-
-        await new Promise(resolve => setTimeout(resolve, 200));
-        const records = await notesCollection.getAllRecords();
-        const record = records.find(r => r.guid === recordGuid);
-        if (!record) throw new Error('Record not found');
-
-        if (window.syncHub && window.syncHub.insertMarkdown) {
-            try {
-                await window.syncHub.insertMarkdown(noteContent, record, null);
-                console.log('[Scan] Markdown inserted successfully');
-            } catch (error) {
-                console.error('[Scan] insertMarkdown failed:', error);
-                const textProp = record.prop('text');
-                if (textProp) {
-                    textProp.set(noteContent);
-                    console.log('[Scan] Used text property fallback');
-                }
-            }
-        } else {
-            const textProp = record.prop('text');
-            if (textProp) {
-                textProp.set(noteContent);
-                console.log('[Scan] Used text property (no syncHub)');
-            } else {
-                console.error('[Scan] No text property available!');
-            }
-        }
-
-        return record;
-    }
-
-    generateSchema(vaultName, topFolders, properties, source = 'obsidian') {
-        console.log('[Schema] Generating collection schema');
-        
-        const fields = [];
-        const prefix = this.slugify(vaultName).toUpperCase().slice(0, 6) || 'VAULT';
-        const sourceLabel = source === 'logseq' ? 'Logseq' : 'Obsidian';
-
-        if (topFolders.length > 0) {
-            const folderChoices = topFolders
-                .map((folder, i) => {
-                    const id = this.slugify(folder);
-                    if (!id) return null;
-                    return {
-                        id: id,
-                        label: folder,
-                        color: String(i % 10),
-                        active: true
-                    };
-                })
-                .filter(c => c !== null);
-
-            if (folderChoices.length > 0) {
-                fields.push({
-                    id: 'folder',
-                    label: 'Folder',
-                    type: 'choice',
-                    icon: 'ti-folder',
-                    many: false,
-                    read_only: false,
-                    active: true,
-                    choices: folderChoices
-                });
-            }
-        }
-
-        // Track source path for deduplication and audits
-        fields.push({
-            id: 'source_path',
-            label: 'Source Path',
-            type: 'text',
-            icon: 'ti-link',
-            many: false,
-            read_only: true,
-            active: true
-        });
-
-        for (const prop of properties) {
-            if (prop.percentage < 5) continue;
-
-            const fieldId = this.slugify(prop.key);
-            if (!fieldId) continue;
-
-            // Skip if we already have a field with this ID
-            if (fields.find(f => f.id === fieldId)) {
-                console.log(`[Schema] Skipping duplicate field ID "${fieldId}" (from "${prop.key}")`);
-                continue;
-            }
-
-            // Force common date field names to be datetime type
-            const commonDateFields = ['created', 'modified', 'updated', 'created_at', 'modified_at', 'updated_at', 'date', 'created_date', 'modified_date'];
-            const isCommonDateField = commonDateFields.includes(fieldId) || commonDateFields.includes(prop.key.toLowerCase());
-            
-            let fieldType = prop.recommendedType.type;
-            if (isCommonDateField && (fieldType === 'text' || fieldType === 'choice')) {
-                fieldType = 'datetime';
-                console.log(`[Schema] Forcing "${prop.key}" to datetime type (common date field)`);
-            }
-
-            const field = {
-                id: fieldId,
-                label: prop.key,
-                type: fieldType,
-                icon: this.getIcon(fieldType),
-                many: false,
-                read_only: false,
-                active: true
-            };
-
-            if (fieldType === 'choice' && prop.recommendedType.choices) {
-                const choices = prop.recommendedType.choices
-                    .map((c, i) => {
-                        const choiceId = this.slugify(String(c));
-                        if (!choiceId) return null;
-                        return {
-                            id: choiceId,
-                            label: String(c).trim(),
-                            color: String(i % 10),
-                            active: true
-                        };
-                    })
-                    .filter(c => c !== null);
-                
-                if (choices.length >= 2) {
-                    field.choices = choices;
-                } else {
-                    field.type = 'text';
-                    delete field.choices;
-                }
-            }
-
-            fields.push(field);
-        }
-
-        const views = [];
-        const fieldIds = fields.map(f => f.id);
-        const pageSecondaryField = fieldIds.includes('folder')
-            ? 'folder'
-            : (fieldIds[0] || 'title');
-
-        views.push({
-            id: `V${prefix}001`,
-            shown: true,
-            icon: '',
-            label: 'All Notes',
-            description: '',
-            type: 'table',
-            read_only: false,
-            field_ids: fieldIds.slice(0, 8),
-            group_by_field_id: null,
-            sort_dir: 'asc',
-            sort_field_id: 'title',
-            opts: {}
-        });
-
-        if (fieldIds.includes('folder')) {
-            views.push({
-                id: `V${prefix}002`,
-                shown: true,
-                icon: '',
-                label: 'By Folder',
-                description: '',
-                type: 'board',
-                read_only: false,
-                field_ids: fieldIds.slice(0, 6),
-                group_by_field_id: 'folder',
-                sort_dir: 'asc',
-                sort_field_id: 'title',
-                opts: {}
-            });
-        }
-
-        const schema = {
-            ver: 1,
-            version: '1.0.0',
-            name: vaultName,
-            icon: 'ti-notebook',
-            home: false,
-            item_name: 'Note',
-            description: `Imported from ${sourceLabel}`,
-            page_field_ids: ['title', pageSecondaryField],
-            show_sidebar_items: true,
-            show_cmdpal_items: true,
-            sidebar_record_sort_dir: 'asc',
-            sidebar_record_sort_field_id: 'title',
-            managed: {
-                fields: false,
-                views: false,
-                sidebar: false
-            },
-            custom: {},
-            fields: fields,
-            views: views
-        };
-
-        this.validateSchema(schema);
-        console.log(`[Schema] Valid schema with ${fields.length} fields, ${views.length} views`);
-        return schema;
-    }
-
-    slugify(text) {
-        if (!text) return '';
-        return String(text)
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, '_')
-            .replace(/^_|_$/g, '');
-    }
-
-    getIcon(type) {
-        const icons = {
-            'text': 'ti-abc',
-            'choice': 'ti-tag',
-            'datetime': 'ti-clock',
-            'number': 'ti-123',
-            'url': 'ti-link'
-        };
-        return icons[type] || 'ti-abc';
-    }
-
-    validateSchema(schema) {
-        if (schema.ver !== 1) throw new Error('ver must be 1');
-        if (!schema.name) throw new Error('name required');
-        if (!schema.item_name) throw new Error('item_name required');
-        if (!schema.icon || !schema.icon.startsWith('ti-')) throw new Error('icon must start with ti-');
-        if (!Array.isArray(schema.fields)) throw new Error('fields must be array');
-        if (!Array.isArray(schema.views)) throw new Error('views must be array');
-        if (!Array.isArray(schema.page_field_ids)) throw new Error('page_field_ids must be array');
-
-        const fieldIds = new Set();
-        for (const field of schema.fields) {
-            if (!field.id) throw new Error('field missing id');
-            if (fieldIds.has(field.id)) throw new Error(`duplicate field id: ${field.id}`);
-            fieldIds.add(field.id);
-            if (!field.label) throw new Error(`field ${field.id} missing label`);
-            if (!field.type) throw new Error(`field ${field.id} missing type`);
-            if (field.many === undefined) throw new Error(`field ${field.id} missing many`);
-            if (field.read_only === undefined) throw new Error(`field ${field.id} missing read_only`);
-            if (field.active === undefined) throw new Error(`field ${field.id} missing active`);
-            
-            if (field.type === 'choice') {
-                if (!Array.isArray(field.choices) || field.choices.length === 0) {
-                    throw new Error(`choice field ${field.id} missing choices`);
-                }
-                for (const choice of field.choices) {
-                    if (!choice.id) throw new Error(`choice in ${field.id} missing id`);
-                    if (!choice.label) throw new Error(`choice ${choice.id} missing label`);
-                    if (typeof choice.color !== 'string') throw new Error(`choice ${choice.id} color must be string`);
-                    if (choice.active === undefined) throw new Error(`choice ${choice.id} missing active`);
-                }
-            }
-        }
-
-        const viewIds = new Set();
-        for (const view of schema.views) {
-            if (!view.id) throw new Error('view missing id');
-            if (viewIds.has(view.id)) throw new Error(`duplicate view id: ${view.id}`);
-            viewIds.add(view.id);
-            if (!view.label) throw new Error(`view ${view.id} missing label`);
-            if (!view.type) throw new Error(`view ${view.id} missing type`);
-            if (view.shown === undefined) throw new Error(`view ${view.id} missing shown`);
-            if (view.read_only === undefined) throw new Error(`view ${view.id} missing read_only`);
-            if (!Array.isArray(view.field_ids)) throw new Error(`view ${view.id} field_ids must be array`);
-            if (view.icon === undefined) throw new Error(`view ${view.id} missing icon`);
-            if (view.description === undefined) throw new Error(`view ${view.id} missing description`);
-            if (!view.opts) throw new Error(`view ${view.id} missing opts`);
-        }
-    }
-
-    generateReport(vaultName, scanResults, analysis, schemaJson, source = 'obsidian') {
-        const { totalFiles, filesWithFrontmatter, properties } = analysis;
-        const sourceLabel = source === 'logseq' ? 'Logseq' : 'Obsidian';
-        
-        let report = `# ${sourceLabel} Scan: ${vaultName}\n\n`;
-        report += `**Files:** ${totalFiles} | **With frontmatter/properties:** ${filesWithFrontmatter}\n\n`;
-        
-        report += `## Collection Schema\n\n`;
-        report += `Copy this JSON to create the collection:\n\n`;
-        report += `\`\`\`json\n${schemaJson}\n\`\`\`\n\n`;
-        
-        report += `## Properties Found\n\n`;
-        for (const prop of properties.slice(0, 20)) {
-            const fieldId = this.slugify(prop.key);
-            report += `- **${prop.key}** → \`${fieldId}\` (${prop.percentage}%, ${prop.recommendedType.type})\n`;
-        }
-        
-        report += `\n## Next Steps\n\n`;
-        report += `1. Click + next to Collections in Thymer\n`;
-        report += `2. Click "Edit as code"\n`;
-        report += `3. Copy the JSON schema above\n`;
-        report += `4. Paste into the code editor\n`;
-        report += `5. Save the collection\n`;
-        report += `6. Run "Import Obsidian Vault" command\n`;
-        
-        console.log(`[Scan] Generated report (${report.length} characters)`);
-        console.log('[Scan] First 200 chars:', report.substring(0, 200));
-        
-        return report;
-    }
-
     // =========================================================================
-    // IMPORT COMMAND
+    // IMPORT EXECUTION (Markdown)
     // =========================================================================
-
-    async importVault() {
-        try {
-            const source = this.chooseSource();
-            if (!source) return;
-
-            const collection = await this.chooseCollection();
-            if (!collection) return;
-
-            const dirHandle = await this.pickFolder();
-            if (!dirHandle) return;
-
-            this.showToast('Scanning files...', 3000);
-            const scanResults = source === 'logseq'
-                ? await this.scanLogseqFiles(dirHandle)
-                : await this.scanVaultFiles(dirHandle);
-
-            if (scanResults.files.length === 0) {
-                this.showToast('No files found', 3000);
-                return;
-            }
-
-            const confirmed = confirm(
-                `Import ${scanResults.files.length} files to ${collection.getName()}?`
-            );
-            if (!confirmed) return;
-
-            await this.executeImport(collection, scanResults.files, source);
-
-        } catch (error) {
-            console.error('[Import] Error:', error);
-            this.showToast(`Import failed: ${error.message}`, 5000);
-        }
-    }
-
-    async chooseCollection() {
-        const collections = await this.data.getAllCollections();
-        const userCollections = collections.filter(c => {
-            const name = c.getName();
-            return name !== 'Sync Hub' && name !== 'Journal';
-        });
-
-        if (userCollections.length === 0) {
-            throw new Error('No collections found');
-        }
-
-        const names = userCollections.map(c => c.getName()).join('\n');
-        const chosen = prompt(`Select collection:\n\n${names}\n\nEnter name:`);
-        if (!chosen) return null;
-
-        const collection = userCollections.find(c => 
-            c.getName().toLowerCase() === chosen.toLowerCase()
-        );
-
-        if (!collection) {
-            throw new Error(`Collection "${chosen}" not found`);
-        }
-
-        return collection;
-    }
 
     async executeImport(collection, files, source = 'obsidian', statusDiv = null) {
         let imported = 0;
@@ -2324,7 +2641,6 @@ class Plugin extends AppPlugin {
             }
         }
 
-        // PHASE 1: Create all records with properties and markdown (wiki-links unchanged)
         if (statusDiv) {
             this.showStatus(statusDiv, 'Phase 1: Creating records with content...', 'info');
         } else {
@@ -2355,7 +2671,6 @@ class Plugin extends AppPlugin {
                 const existing = existingByKey.get(dedupKey) || existingByKey.get(fallbackKey);
 
                 if (existing) {
-                    // Update existing record
                     this.setFieldValue(existing, 'source_path', file.path);
                     this.setFieldValue(existing, 'folder', file.topFolder);
                     this.setFieldValue(existing, 'source', source);
@@ -2367,11 +2682,8 @@ class Plugin extends AppPlugin {
                         this.rememberBlockIds(parsed.blockIds, existing);
                     }
                     
-                    // Wait for record to be ready before inserting content
-                    console.log(`[Import] Updating existing record. Waiting 200ms before content insertion...`);
                     await new Promise(resolve => setTimeout(resolve, 200));
                     
-                    // Insert markdown WITHOUT converting wiki-links
                     if (parsed.markdown) {
                         const convertedMarkdown = this.convertMarkdown(parsed.markdown, source);
                         try {
@@ -2387,11 +2699,9 @@ class Plugin extends AppPlugin {
                     existingByKey.set(dedupKey, existing);
                     existingByKey.set(fallbackKey, existing);
                 } else {
-                    // Create new record
                     const recordGuid = collection.createRecord(recordTitle);
                     if (!recordGuid) throw new Error('Failed to create record');
 
-                    // Wait for record to be available with retry logic
                     let record = null;
                     for (let attempt = 0; attempt < 5; attempt++) {
                         await new Promise(resolve => setTimeout(resolve, 100 + (attempt * 50)));
@@ -2405,8 +2715,6 @@ class Plugin extends AppPlugin {
                         throw new Error('Record not found after 5 attempts');
                     }
 
-                    // CRITICAL: Wait for record to fully initialize before inserting content
-                    console.log(`[Import] Record found. Waiting 300ms for initialization...`);
                     await new Promise(resolve => setTimeout(resolve, 300));
 
                     this.setFieldValue(record, 'source_path', file.path);
@@ -2420,7 +2728,6 @@ class Plugin extends AppPlugin {
                         this.rememberBlockIds(parsed.blockIds, record);
                     }
 
-                    // Insert markdown WITHOUT converting wiki-links
                     if (parsed.markdown) {
                         const convertedMarkdown = this.convertMarkdown(parsed.markdown, source);
                         try {
@@ -2441,9 +2748,6 @@ class Plugin extends AppPlugin {
             }
         }
 
-        // PHASE 2: Resolve wiki-links using segments API
-        // Add a delay to allow line item segments to persist
-        console.log('[Import] Waiting 1 second for line items to persist before wiki-link resolution...');
         await new Promise(resolve => setTimeout(resolve, 1000));
         
         if (statusDiv) {
@@ -2459,7 +2763,6 @@ class Plugin extends AppPlugin {
             this.showToast(`Done! Imported: ${imported} | Updated: ${updated} | Errors: ${errors}`, 10000);
         }
         
-        // Return the counts
         return { imported, updated, errors };
     }
 
@@ -2468,8 +2771,6 @@ class Plugin extends AppPlugin {
         const nameToRecord = new Map();
         const blockIdToRecord = this.blockIdToRecord || new Map();
         
-        // Build lookup map
-        console.log('[WikiLinks] Building name→record lookup map...');
         for (const record of records) {
             const name = record.getName();
             if (name) {
@@ -2477,51 +2778,27 @@ class Plugin extends AppPlugin {
             }
         }
         
-        console.log(`[WikiLinks] Processing ${records.length} records for wiki-link resolution`);
-        
         let linksFound = 0;
         let linksResolved = 0;
-        let totalLineItems = 0;
-        let lineItemsWithSegments = 0;
         
-        // Process each record
         for (const record of records) {
             try {
-                console.log(`[WikiLinks] Processing record: ${record.getName()}`);
                 const lineItems = await record.getLineItems();
                 
                 if (!lineItems || lineItems.length === 0) {
-                    console.log(`[WikiLinks]   No line items found`);
                     continue;
                 }
-                
-                console.log(`[WikiLinks]   Found ${lineItems.length} line items`);
                 
                 for (let i = 0; i < lineItems.length; i++) {
                     try {
                         const lineItem = lineItems[i];
-                        totalLineItems++;
                         
-                        // Debug: Check what properties/methods the lineItem has
-                        if (i === 0) {
-                            console.log('[WikiLinks]   Line item properties:', Object.keys(lineItem));
-                            console.log('[WikiLinks]   Has segments property?', 'segments' in lineItem);
-                            console.log('[WikiLinks]   Has getSegments method?', typeof lineItem.getSegments);
-                            console.log('[WikiLinks]   Line item:', lineItem);
-                        }
-                        
-                        // Try accessing segments as a property
                         const segments = lineItem.segments || null;
                         
                         if (!segments || segments.length === 0) {
-                            if (i === 0) console.log(`[WikiLinks]   No segments found in line item`);
                             continue;
                         }
                         
-                        lineItemsWithSegments++;
-                        console.log(`[WikiLinks]   Line ${i}: ${segments.length} segments`);
-                        
-                        // Set task status for Logseq checkboxes
                         if (source === 'logseq') {
                             const lineText = segments
                                 .map(seg => (seg.type === 'text' && typeof seg.text === 'string') ? seg.text : '')
@@ -2534,19 +2811,16 @@ class Plugin extends AppPlugin {
                             }
                         }
 
-                        // Check if any text segment contains [[...]] or ((...))
                         let hasLinks = false;
                         for (const segment of segments) {
                             if (segment.type === 'text' && segment.text && (segment.text.includes('[[') || segment.text.includes('(('))) {
                                 hasLinks = true;
-                                console.log(`[WikiLinks]     Found link in text: "${segment.text}"`);
                                 break;
                             }
                         }
                         
                         if (!hasLinks) continue;
                         
-                        // Build new segments array with refs
                         const newSegments = [];
                         
                         for (const segment of segments) {
@@ -2571,36 +2845,30 @@ class Plugin extends AppPlugin {
                                         targetRecord = nameToRecord.get(pageName.toLowerCase()) || null;
                                     }
                                     
-                                    // Add text before the link
                                     if (match.index > lastIndex) {
                                         const textBefore = segment.text.substring(lastIndex, match.index);
                                         newSegments.push({
                                             type: 'text',
                                             text: textBefore
                                         });
-                                        console.log(`[WikiLinks]     Text before: "${textBefore}"`);
                                     }
                                     
-                                    // Add ref segment or keep as text if not found
                                     if (targetRecord) {
                                         newSegments.push({
                                             type: 'ref',
                                             text: targetRecord.guid
                                         });
                                         linksResolved++;
-                                        console.log(`[WikiLinks]     ✓ Resolved link → ${targetRecord.guid}`);
                                     } else {
                                         newSegments.push({
                                             type: 'text',
                                             text: match[0]
                                         });
-                                        console.log(`[WikiLinks]     ✗ Could not resolve link "${match[0]}"`);
                                     }
                                     
                                     lastIndex = match.index + match[0].length;
                                 }
                                 
-                                // Add remaining text after last link
                                 if (matched) {
                                     if (lastIndex < segment.text.length) {
                                         const textAfter = segment.text.substring(lastIndex);
@@ -2608,26 +2876,19 @@ class Plugin extends AppPlugin {
                                             type: 'text',
                                             text: textAfter
                                         });
-                                        console.log(`[WikiLinks]     Text after: "${textAfter}"`);
                                     }
                                 } else {
                                     newSegments.push(segment);
                                 }
                             } else {
-                                // Keep non-text segments as-is
                                 newSegments.push(segment);
                             }
                         }
                         
-                        // Update line item with new segments
-                        console.log(`[WikiLinks]   Updating line with ${newSegments.length} segments`);
                         await lineItem.setSegments(newSegments);
-                        console.log(`[WikiLinks]   ✓ Line ${i} updated successfully`);
                         
                     } catch (lineError) {
-                        // Catch errors at line item level so we can continue processing other lines
                         console.error(`[WikiLinks] Error processing line ${i}:`, lineError);
-                        // Continue to next line item
                     }
                 }
                 
@@ -2636,8 +2897,6 @@ class Plugin extends AppPlugin {
             }
         }
         
-        console.log(`[WikiLinks] Summary: ${totalLineItems} total line items, ${lineItemsWithSegments} had segments (${((lineItemsWithSegments/totalLineItems)*100).toFixed(1)}%)`);
-        console.log(`[WikiLinks] Complete: Found ${linksFound} links, resolved ${linksResolved}`);
         this.showToast(`Found ${linksFound} wiki/block links, resolved ${linksResolved}`, 5000);
     }
 
@@ -2680,12 +2939,10 @@ class Plugin extends AppPlugin {
         
         for (const fieldId of variations) {
             if (this.setFieldValue(record, fieldId, transformedValue)) {
-                console.log(`[Import] Matched "${frontmatterKey}" → "${fieldId}"`);
                 return true;
             }
         }
         
-        console.log(`[Import] No match for "${frontmatterKey}"`);
         return false;
     }
 
@@ -2706,40 +2963,33 @@ class Plugin extends AppPlugin {
             const prop = record.prop(fieldId);
             if (!prop) return false;
 
-            // DateTime fields - date only (no time)
             if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) {
                 try {
                     const dateOnly = value.match(/^\d{4}-\d{2}-\d{2}/)[0];
                     const [year, month, day] = dateOnly.split('-');
                     
-                    // Try to set date-only value (YYYYMMDD format)
                     prop.set({
                         d: year + month + day
                     });
                     return true;
                 } catch (e) {
-                    // If date object fails, try setting the string directly
                     try {
                         prop.set(value);
                         return true;
                     } catch (e2) {
-                        // Fall through to other methods
                     }
                 }
             }
 
-            // Choice fields
             if (typeof value === 'string' && typeof prop.setChoice === 'function') {
                 try {
                     if (prop.setChoice(value)) {
                         return true;
                     }
                 } catch (e) {
-                    // Fall through
                 }
             }
 
-            // Default
             prop.set(value);
             return true;
 
@@ -2766,7 +3016,6 @@ class Plugin extends AppPlugin {
         let converted = markdown;
 
         if (source === 'logseq') {
-            // Convert Logseq TODO/DONE to Markdown checkboxes
             converted = converted.replace(/^(\s*)[-*]\s*TODO\s+(.*)$/gmi, '$1- [ ] $2');
             converted = converted.replace(/^(\s*)[-*]\s*DONE\s+(.*)$/gmi, '$1- [x] $2');
         }
@@ -2783,13 +3032,9 @@ class Plugin extends AppPlugin {
     }
 
     // =========================================================================
-    // MARKDOWN INSERTION (Self-contained)
+    // MARKDOWN INSERTION
     // =========================================================================
 
-    /**
-     * Insert markdown into a record.
-     * Self-contained version - doesn't depend on window.syncHub
-     */
     async insertMarkdown(markdown, targetRecord, afterItem = null) {
         if (!targetRecord) {
             console.error('[Import] insertMarkdown: No target record provided');
@@ -2804,36 +3049,29 @@ class Plugin extends AppPlugin {
         const BLANK_LINE_BEFORE_HEADINGS = true;
         
         const allLines = markdown.split('\n');
-        console.log(`[Import] Processing ${allLines.length} lines for record ${record.getName()}`);
 
         for (let lineIdx = 0; lineIdx < allLines.length; lineIdx++) {
             const line = allLines[lineIdx];
             
-            // Code fence
             const fenceMatch = line.match(/^(\s*)```(.*)$/);
             if (fenceMatch) {
                 if (inCode) {
-                    // Closing fence - create code block
                     const lang = codeLang, code = [...codeLines];
                     promise = promise.then(async (last) => {
                         const block = await record.createLineItem(null, last, 'block');
                         if (!block) return last;
                         
-                        // Set language if available
                         try { 
                             if (lang && block.setHighlightLanguage) {
                                 block.setHighlightLanguage(lang); 
                             }
                         } catch(e) {
-                            console.warn('[Import] Could not set code language:', e);
                         }
                         
-                        // Set content - join with newlines, preserving empty lines
                         const codeText = code.join('\n');
                         try {
                             await block.setSegments([{ type: 'text', text: codeText }]);
                         } catch(e) {
-                            console.error('[Import] Failed to set code block segments:', e);
                         }
                         
                         rendered++;
@@ -2843,7 +3081,6 @@ class Plugin extends AppPlugin {
                     codeLang = '';
                     codeLines = [];
                 } else {
-                    // Opening fence
                     inCode = true;
                     codeLang = fenceMatch[2].trim();
                 }
@@ -2859,12 +3096,10 @@ class Plugin extends AppPlugin {
 
             const parsed = this.parseLine(line);
             if (!parsed) {
-                console.log(`[Import] Line ${lineIdx} SKIPPED (no parse result): "${line.substring(0, 80)}"`);
                 continue;
             }
             
             if (parsed.segments.length === 0) {
-                console.log(`[Import] Line ${lineIdx} SKIPPED (empty segments): "${line.substring(0, 80)}"`);
                 continue;
             }
 
@@ -2873,11 +3108,9 @@ class Plugin extends AppPlugin {
             const needsBlankLine = BLANK_LINE_BEFORE_HEADINGS && isHeading && !isFirstBlock;
 
             promise = promise.then(async (last) => {
-                console.log(`[Import] Promise callback executing for type=${type}`);
                 try {
                     let insertAfter = last;
 
-                    // Add blank line before headings (except first block)
                     if (needsBlankLine) {
                         const blank = await record.createLineItem(null, insertAfter, 'text');
                         if (blank) {
@@ -2886,54 +3119,37 @@ class Plugin extends AppPlugin {
                         }
                     }
 
-                    // Try to create line item with retry logic
                     let item = null;
                     for (let attempt = 0; attempt < 3; attempt++) {
                         item = await record.createLineItem(null, insertAfter, type);
                         if (item) break;
                         
                         if (attempt < 2) {
-                            console.warn(`[Import] createLineItem attempt ${attempt + 1} failed, retrying in ${50 * (attempt + 1)}ms...`);
                             await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
                         }
                     }
                     
                     if (!item) {
-                        console.error(`[Import] Failed to create line item for type=${type} after 3 attempts. Record:`, record);
-                        console.error(`[Import] insertAfter:`, insertAfter, `type:`, type);
                         return last;
                     }
 
-                    // Set heading size for h2-h6
                     if (isHeading && level > 1) {
                         try { 
                             if (item.setHeadingSize) {
                                 item.setHeadingSize(level); 
                             }
                         } catch(e) {
-                            console.warn('[Import] Could not set heading size:', e);
                         }
                     }
 
                     try {
-                        console.log(`[Import] Setting ${segments.length} segments on ${type} item:`, segments);
                         await item.setSegments(segments);
-                        
-                        // Verify segments were actually set
-                        const verifySegments = item.segments || [];
-                        console.log(`[Import] ✓ Segments set successfully. Verified ${verifySegments.length} segments persisted.`);
-                        
-                        if (verifySegments.length === 0 && segments.length > 0) {
-                            console.error(`[Import] ⚠️ WARNING: setSegments succeeded but segments array is empty!`);
-                        }
                     } catch (e) {
-                        console.error(`[Import] ✗ Failed to set segments:`, e, segments);
                     }
                     
                     rendered++;
                     return item;
                 } catch (error) {
-                    console.error(`[Import] Error in promise chain:`, error, `type=${type}, segments=`, segments);
                     return last;
                 }
             });
@@ -2941,28 +3157,20 @@ class Plugin extends AppPlugin {
             isFirstBlock = false;
         }
 
-        console.log(`[Import] Awaiting promise chain for ${rendered} queued items...`);
         await promise;
-        console.log(`[Import] Inserted ${rendered} line items`);
         return rendered;
     }
 
-    /**
-     * Parse a single line of markdown into type + segments
-     */
     parseLine(line) {
         if (!line.trim()) return null;
 
-        // Horizontal rule
         if (/^(\*\s*\*\s*\*|\-\s*\-\s*\-|_\s*_\s*_)[\s\*\-_]*$/.test(line.trim())) {
             return { type: 'br', segments: [] };
         }
 
-        // Headings
         const hMatch = line.match(/^(#{1,6})\s+(.+)$/);
         if (hMatch) {
             const segments = this.parseInlineFormatting(hMatch[2]);
-            console.log(`[Parse] Heading: level=${hMatch[1].length}, content="${hMatch[2].substring(0, 50)}", segments=${segments.length}`);
             return {
                 type: 'heading',
                 level: hMatch[1].length,
@@ -2970,76 +3178,58 @@ class Plugin extends AppPlugin {
             };
         }
 
-        // Task list - require non-whitespace content after checkbox
         const taskMatch = line.match(/^(\s*)[-*]\s+\[([ xX])\]\s+(.+)$/);
         if (taskMatch) {
             const content = taskMatch[3].trim();
             if (!content) {
-                console.log(`[Parse] Task SKIPPED (empty): "${line.substring(0, 80)}"`);
-                return null; // Skip empty tasks
+                return null;
             }
             const segments = this.parseInlineFormatting(taskMatch[3]);
-            console.log(`[Parse] Task: content="${taskMatch[3].substring(0, 50)}", segments=${segments.length}`);
             return { type: 'task', segments: segments };
         }
 
-        // Unordered list - require non-whitespace content
         const ulMatch = line.match(/^(\s*)[-*]\s+(.+)$/);
         if (ulMatch) {
             const content = ulMatch[2].trim();
             if (!content) {
-                console.log(`[Parse] Bullet SKIPPED (empty): "${line.substring(0, 80)}"`);
-                return null; // Skip empty bullets
+                return null;
             }
             const segments = this.parseInlineFormatting(ulMatch[2]);
-            console.log(`[Parse] Bullet: content="${ulMatch[2].substring(0, 50)}", segments=${segments.length}`);
             return { type: 'ulist', segments: segments };
         }
 
-        // Ordered list - require non-whitespace content
         const olMatch = line.match(/^(\s*)\d+\.\s+(.+)$/);
         if (olMatch) {
             const content = olMatch[2].trim();
             if (!content) {
-                console.log(`[Parse] Numbered SKIPPED (empty): "${line.substring(0, 80)}"`);
-                return null; // Skip empty numbered items
+                return null;
             }
             const segments = this.parseInlineFormatting(olMatch[2]);
-            console.log(`[Parse] Numbered: content="${olMatch[2].substring(0, 50)}", segments=${segments.length}`);
             return { type: 'olist', segments: segments };
         }
 
-        // Quote
         if (line.startsWith('> ')) {
             const content = line.slice(2).trim();
             if (!content) {
-                console.log(`[Parse] Quote SKIPPED (empty): "${line.substring(0, 80)}"`);
-                return null; // Skip empty quotes
+                return null;
             }
             const segments = this.parseInlineFormatting(line.slice(2));
-            console.log(`[Parse] Quote: content="${line.slice(2).substring(0, 50)}", segments=${segments.length}`);
             return { type: 'quote', segments: segments };
         }
 
-        // Regular text - must have content
         const content = line.trim();
         if (!content) return null;
         
         const segments = this.parseInlineFormatting(line);
-        console.log(`[Parse] Text: content="${line.substring(0, 50)}", segments=${segments.length}`);
         return { type: 'text', segments: segments };
     }
 
-    /**
-     * Parse inline formatting (bold, italic, code)
-     */
     parseInlineFormatting(text) {
         const segments = [];
         let currentText = '';
         let i = 0;
 
         while (i < text.length) {
-            // Code (backticks)
             if (text[i] === '`') {
                 if (currentText) {
                     segments.push({ type: 'text', text: currentText });
@@ -3053,7 +3243,6 @@ class Plugin extends AppPlugin {
                 }
             }
 
-            // Bold (** or __)
             if ((text[i] === '*' && text[i + 1] === '*') || (text[i] === '_' && text[i + 1] === '_')) {
                 if (currentText) {
                     segments.push({ type: 'text', text: currentText });
@@ -3068,7 +3257,6 @@ class Plugin extends AppPlugin {
                 }
             }
 
-            // Italic (* or _)
             if (text[i] === '*' || text[i] === '_') {
                 if (currentText) {
                     segments.push({ type: 'text', text: currentText });
@@ -3130,5 +3318,13 @@ class Plugin extends AppPlugin {
             statusDiv.style.border = `1px solid ${typeColors[type] || colors.info}`;
             statusDiv.style.color = typeColors[type] || colors.text;
         }
+    }
+
+    slugify(text) {
+        if (!text) return '';
+        return String(text)
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '_')
+            .replace(/^_|_$/g, '');
     }
 }
