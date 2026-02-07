@@ -1,8 +1,9 @@
-const VERSION = 'v0.0.6';
+const VERSION = 'v0.0.7';
 /**
  * Unified Import Plugin for Thymer
  * Supports CSV, Obsidian Markdown, and Logseq imports with UI
  * 
+ * v0.0.7 - Added an option to autodetect (or select folder) for journal entries in import and automatically import them into your Thymer Journal collection
  * v0.0.6 - Added "Import Daily Notes to Journal" command
  * v0.0.5 - Added "Fix broken [[wikilinks]]" command
  * v0.0.4 - Merged version combining:
@@ -1850,6 +1851,27 @@ class Plugin extends AppPlugin {
                 <div id="folder-info" style="margin-top: 8px; font-size: 12px; color: ${colors.textSecondary};"></div>
             </div>
             
+            <div style="margin-bottom: 16px; padding: 16px; background: ${colors.backgroundSecondary}; border-radius: 6px; border: 1px solid ${colors.border};">
+                <label style="display: flex; align-items: center; cursor: pointer; user-select: none;">
+                    <input type="checkbox" id="import-journals-checkbox" style="margin-right: 8px; cursor: pointer;">
+                    <span style="font-weight: 500; color: ${colors.text};">Import daily notes to Journal</span>
+                </label>
+                <div id="journal-folder-container" style="margin-top: 12px; display: none;">
+                    <label style="display: block; margin-bottom: 6px; font-size: 13px; color: ${colors.textSecondary};">
+                        Journal folder name (leave blank for auto-detect):
+                    </label>
+                    <input 
+                        type="text" 
+                        id="journal-folder-input" 
+                        placeholder="e.g., Daily Notes, journals, Journal"
+                        style="width: 100%; padding: 6px 8px; border: 1px solid ${colors.inputBorder}; border-radius: 4px; background: ${colors.input}; color: ${colors.text}; font-size: 13px;"
+                    >
+                    <div style="margin-top: 6px; font-size: 12px; color: ${colors.textSecondary};">
+                        💡 Files in this folder will be imported to your Thymer Journal instead of the collection
+                    </div>
+                </div>
+            </div>
+            
             <div style="display: flex; gap: 8px; justify-content: flex-end;">
                 <button id="md-cancel-btn" style="padding: 8px 16px; border: 1px solid ${colors.buttonBorder}; background: ${colors.buttonBg}; color: ${colors.buttonText}; border-radius: 4px; cursor: pointer;">Cancel</button>
                 <button id="md-import-btn" style="padding: 8px 16px; border: none; background: ${colors.primary}; color: #fff; border-radius: 4px; cursor: pointer;" disabled>Import</button>
@@ -1865,7 +1887,14 @@ class Plugin extends AppPlugin {
         const collectionSelect = dialog.querySelector('#md-collection-select');
         const newCollectionNameContainer = dialog.querySelector('#new-collection-name-container');
         const importBtn = dialog.querySelector('#md-import-btn');
+        const journalCheckbox = dialog.querySelector('#import-journals-checkbox');
+        const journalFolderContainer = dialog.querySelector('#journal-folder-container');
         let selectedDirHandle = null;
+
+        // Toggle journal folder input visibility
+        journalCheckbox.addEventListener('change', () => {
+            journalFolderContainer.style.display = journalCheckbox.checked ? 'block' : 'none';
+        });
 
         collectionSelect.addEventListener('change', () => {
             if (collectionSelect.value === '__CREATE_NEW__') {
@@ -1942,10 +1971,14 @@ class Plugin extends AppPlugin {
         const statusDiv = dialog.querySelector('#md-status');
         const importBtn = dialog.querySelector('#md-import-btn');
         const newCollectionNameInput = dialog.querySelector('#new-collection-name');
+        const journalCheckbox = dialog.querySelector('#import-journals-checkbox');
+        const journalFolderInput = dialog.querySelector('#journal-folder-input');
 
         const collectionGuid = select.value;
         const source = sourceSelect.value;
         const isCreatingNew = collectionGuid === '__CREATE_NEW__';
+        const importToJournal = journalCheckbox.checked;
+        const journalFolderName = journalFolderInput.value.trim();
 
         if (isCreatingNew) {
             const newName = newCollectionNameInput.value.trim();
@@ -1971,37 +2004,93 @@ class Plugin extends AppPlugin {
                 return;
             }
 
-            this.showStatus(statusDiv, `Analyzing ${scanResults.files.length} files...`, 'info');
+            // Separate journal files from regular files if journal import is enabled
+            let journalFiles = [];
+            let regularFiles = scanResults.files;
             
-            const analysis = source === 'logseq'
-                ? await this.analyzeLogseqProperties(scanResults.files)
-                : await this.analyzeFrontmatter(scanResults.files);
-
-            let collection;
-
-            if (isCreatingNew) {
-                const newName = newCollectionNameInput.value.trim();
-                this.showStatus(statusDiv, `Creating collection "${newName}"...`, 'info');
-                collection = await this.createMarkdownCollection(newName, scanResults.topFolders, analysis.properties, {});
+            if (importToJournal) {
+                const { journal, regular } = await this.separateJournalFiles(
+                    scanResults.files, 
+                    source, 
+                    journalFolderName
+                );
+                journalFiles = journal;
+                regularFiles = regular;
                 
-                if (!collection) {
-                    throw new Error('Failed to create collection');
-                }
-            } else {
-                const collections = await this.data.getAllCollections();
-                collection = collections.find(c => c.getGuid() === collectionGuid);
-                if (!collection) {
-                    throw new Error('Collection not found');
-                }
+                console.log(`[MD Import] Separated: ${journalFiles.length} journal files, ${regularFiles.length} regular files`);
             }
 
-            this.showStatus(statusDiv, 'Importing files...', 'info');
-            const importResult = await this.executeImport(collection, scanResults.files, source, statusDiv);
+            // Import journal files first if any
+            if (journalFiles.length > 0) {
+                this.showStatus(statusDiv, `Importing ${journalFiles.length} journal entries...`, 'info');
+                
+                const collections = await this.data.getAllCollections();
+                const journalCollection = collections.find(c => c.isJournalPlugin());
+                
+                if (!journalCollection) {
+                    this.showStatus(statusDiv, 'Journal not enabled. Enable Journal to import daily notes.', 'error');
+                    importBtn.disabled = false;
+                    importBtn.textContent = 'Import';
+                    return;
+                }
+                
+                await this.importDailyNotesFromFiles(journalCollection, journalFiles, source, statusDiv);
+            }
 
-            this.showStatus(statusDiv, 'Resolving links...', 'info');
-            await this.resolveWikiLinksWithSegments(collection, source, statusDiv);
+            // Import regular files to collection
+            let importResult = { imported: 0, updated: 0, errors: 0 };
+            
+            if (regularFiles.length > 0) {
+                this.showStatus(statusDiv, `Analyzing ${regularFiles.length} files...`, 'info');
+                
+                const analysis = source === 'logseq'
+                    ? await this.analyzeLogseqProperties(regularFiles)
+                    : await this.analyzeFrontmatter(regularFiles);
 
-            this.showStatus(statusDiv, `Complete! Imported: ${importResult.imported}, Updated: ${importResult.updated}`, 'success');
+                let collection;
+
+                if (isCreatingNew) {
+                    const newName = newCollectionNameInput.value.trim();
+                    this.showStatus(statusDiv, `Creating collection "${newName}"...`, 'info');
+                    
+                    // Remove journal folder from topFolders if it exists
+                    let topFolders = scanResults.topFolders;
+                    if (importToJournal && journalFolderName) {
+                        topFolders = topFolders.filter(f => 
+                            f.toLowerCase() !== journalFolderName.toLowerCase()
+                        );
+                    }
+                    
+                    collection = await this.createMarkdownCollection(newName, topFolders, analysis.properties, {});
+                    
+                    if (!collection) {
+                        throw new Error('Failed to create collection');
+                    }
+                } else {
+                    const collections = await this.data.getAllCollections();
+                    collection = collections.find(c => c.getGuid() === collectionGuid);
+                    if (!collection) {
+                        throw new Error('Collection not found');
+                    }
+                }
+
+                this.showStatus(statusDiv, 'Importing files...', 'info');
+                importResult = await this.executeImport(collection, regularFiles, source, statusDiv);
+
+                this.showStatus(statusDiv, 'Resolving links...', 'info');
+                await this.resolveWikiLinksWithSegments(collection, source, statusDiv);
+            }
+
+            // Show final summary
+            const summary = [];
+            if (journalFiles.length > 0) {
+                summary.push(`Journal: ${journalFiles.length} entries`);
+            }
+            if (regularFiles.length > 0) {
+                summary.push(`Collection: ${importResult.imported} imported, ${importResult.updated} updated`);
+            }
+            
+            this.showStatus(statusDiv, `Complete! ${summary.join(' | ')}`, 'success');
             
             setTimeout(() => {
                 document.body.removeChild(overlay);
@@ -2014,6 +2103,153 @@ class Plugin extends AppPlugin {
             importBtn.textContent = 'Import';
         }
     }
+
+    async separateJournalFiles(files, source, journalFolderName) {
+        const journal = [];
+        const regular = [];
+        
+        // Auto-detect common journal folder names if not specified
+        const commonJournalFolders = ['daily notes', 'journal', 'journals', 'dailies', 'daily'];
+        const folderToCheck = journalFolderName.toLowerCase() || null;
+        
+        for (const file of files) {
+            let isJournal = false;
+            
+            // Check if file is in the specified journal folder
+            if (folderToCheck) {
+                const pathLower = file.path.toLowerCase();
+                isJournal = pathLower.includes(`/${folderToCheck}/`) || 
+                           pathLower.startsWith(`${folderToCheck}/`) ||
+                           file.topFolder.toLowerCase() === folderToCheck;
+            } else {
+                // Auto-detect based on common folder names
+                const pathLower = file.path.toLowerCase();
+                isJournal = commonJournalFolders.some(folder => 
+                    pathLower.includes(`/${folder}/`) || 
+                    pathLower.startsWith(`${folder}/`) ||
+                    file.topFolder.toLowerCase() === folder
+                );
+            }
+            
+            // Also check if filename is date-formatted (even outside journal folder)
+            if (!isJournal) {
+                const hasDateFormat = source === 'logseq' 
+                    ? this.parseLogseqDateFromFilename(file.name)
+                    : this.parseObsidianDateFromFilename(file.name);
+                
+                if (hasDateFormat && !folderToCheck) {
+                    isJournal = true;
+                }
+            }
+            
+            if (isJournal) {
+                journal.push(file);
+            } else {
+                regular.push(file);
+            }
+        }
+        
+        return { journal, regular };
+    }
+
+    async importDailyNotesFromFiles(journalCollection, files, source, statusDiv) {
+        let imported = 0;
+        let updated = 0;
+        let errors = 0;
+
+        console.log(`[Journal Import] Importing ${files.length} journal files`);
+
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+
+            try {
+                if (i % 5 === 0) {
+                    this.showStatus(statusDiv, `Importing journal ${i + 1}/${files.length}`, 'info');
+                }
+
+                console.log(`[Journal Import] Processing: ${file.name}`);
+
+                // Parse date from filename
+                const dateStr = source === 'logseq'
+                    ? this.parseLogseqDateFromFilename(file.name)
+                    : this.parseObsidianDateFromFilename(file.name);
+                
+                if (!dateStr) {
+                    console.error(`[Journal Import] Could not parse date from filename: ${file.name}`);
+                    errors++;
+                    continue;
+                }
+
+                // Read the file content
+                const fileHandle = await this.getFileFromHandle(file.handle);
+                const content = await fileHandle.text();
+
+                // Parse the markdown
+                const parsed = source === 'logseq'
+                    ? this.parseLogseqFile(content)
+                    : this.parseMarkdownFile(content);
+
+                // Parse date components
+                const [year, month, day] = dateStr.split('-').map(n => parseInt(n));
+
+                // Get current user
+                const users = this.data.getActiveUsers();
+                const currentUser = users[0];
+                
+                if (!currentUser) {
+                    console.error(`[Journal Import] No active user found`);
+                    errors++;
+                    continue;
+                }
+
+                // Create DateTime object (month is 0-indexed)
+                const dateTime = DateTime.dateOnly(year, month - 1, day);
+
+                // Get or create journal record
+                const journalRecord = await journalCollection.getJournalRecord(currentUser, dateTime);
+                
+                if (!journalRecord) {
+                    console.error(`[Journal Import] Failed to get/create journal record for ${dateStr}`);
+                    errors++;
+                    continue;
+                }
+
+                // Wait for record to be ready
+                await new Promise(resolve => setTimeout(resolve, 500));
+
+                // Check if new or existing
+                const lineItems = await journalRecord.getLineItems();
+                const isNew = !lineItems || lineItems.length === 0;
+
+                if (isNew) {
+                    imported++;
+                } else {
+                    updated++;
+                }
+
+                // Insert markdown content
+                if (parsed.markdown) {
+                    const success = await journalRecord.insertFromMarkdown(
+                        parsed.markdown,
+                        null,
+                        null
+                    );
+                    
+                    if (!success) {
+                        console.error(`[Journal Import] insertFromMarkdown returned false for ${file.name}`);
+                        errors++;
+                    }
+                }
+
+            } catch (error) {
+                console.error(`[Journal Import] Error processing ${file.name}:`, error);
+                errors++;
+            }
+        }
+
+        console.log(`[Journal Import] Complete: ${imported} imported, ${updated} updated, ${errors} errors`);
+    }
+
 
     async createMarkdownCollection(collectionName, topFolders, properties, propertyConfig) {
         console.log('[MD Import] Creating collection:', collectionName);
