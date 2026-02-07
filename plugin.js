@@ -477,6 +477,9 @@ class Plugin extends AppPlugin {
                     continue;
                 }
 
+                // Important: Wait for the record to be fully initialized
+                await new Promise(resolve => setTimeout(resolve, 500));
+
                 // Check if this is a new record or existing
                 const lineItems = await journalRecord.getLineItems();
                 const isNew = !lineItems || lineItems.length === 0;
@@ -489,23 +492,26 @@ class Plugin extends AppPlugin {
                     updated++;
                 }
 
-                // Clear existing content if updating
-                if (!isNew) {
-                    const textProp = journalRecord.prop('text');
-                    if (textProp) textProp.set('');
-                }
-
-                // Wait for record to be ready
-                await new Promise(resolve => setTimeout(resolve, 300));
-
-                // Insert the markdown content
+                // Insert the markdown content using the native API
                 if (parsed.markdown) {
-                    const convertedMarkdown = this.convertMarkdown(parsed.markdown, source);
+                    console.log(`[Journal Import] Inserting ${parsed.markdown.length} characters of markdown`);
+                    
                     try {
-                        await this.insertMarkdown(convertedMarkdown, journalRecord, null);
-                        console.log(`[Journal Import] ✓ Successfully imported ${note.filename}`);
+                        // Use the native insertFromMarkdown method
+                        const success = await journalRecord.insertFromMarkdown(
+                            parsed.markdown,
+                            null,  // parentItem: null = use record as parent
+                            null   // afterItem: null = insert as first child
+                        );
+                        
+                        if (success) {
+                            console.log(`[Journal Import] ✓ Successfully imported ${note.filename}`);
+                        } else {
+                            console.error(`[Journal Import] insertFromMarkdown returned false for ${note.filename}`);
+                            errors++;
+                        }
                     } catch (error) {
-                        console.error(`[Journal Import] insertMarkdown failed for ${note.filename}:`, error);
+                        console.error(`[Journal Import] insertFromMarkdown failed for ${note.filename}:`, error);
                         errors++;
                     }
                 } else {
@@ -2523,7 +2529,8 @@ class Plugin extends AppPlugin {
             bodyLines.push(line);
         }
 
-        const markdown = this.convertMarkdown(bodyLines.join('\n'), 'logseq');
+        // Return raw markdown - let the native insertFromMarkdown handle conversions
+        const markdown = bodyLines.join('\n');
         return { frontmatter, markdown, blockIds: Array.from(blockIds) };
     }
 
@@ -2685,13 +2692,17 @@ class Plugin extends AppPlugin {
                     await new Promise(resolve => setTimeout(resolve, 200));
                     
                     if (parsed.markdown) {
-                        const convertedMarkdown = this.convertMarkdown(parsed.markdown, source);
                         try {
                             const textProp = existing.prop('text');
                             if (textProp) textProp.set('');
-                            await this.insertMarkdown(convertedMarkdown, existing, null);
+                            
+                            // Use native insertFromMarkdown
+                            const success = await existing.insertFromMarkdown(parsed.markdown, null, null);
+                            if (!success) {
+                                console.error(`[Import] insertFromMarkdown returned false for ${existing.getName()}`);
+                            }
                         } catch (error) {
-                            console.error(`[Import] insertMarkdown failed for ${existing.getName()}:`, error);
+                            console.error(`[Import] insertFromMarkdown failed for ${existing.getName()}:`, error);
                         }
                     }
                     updated++;
@@ -2729,11 +2740,14 @@ class Plugin extends AppPlugin {
                     }
 
                     if (parsed.markdown) {
-                        const convertedMarkdown = this.convertMarkdown(parsed.markdown, source);
                         try {
-                            await this.insertMarkdown(convertedMarkdown, record, null);
+                            // Use native insertFromMarkdown
+                            const success = await record.insertFromMarkdown(parsed.markdown, null, null);
+                            if (!success) {
+                                console.error(`[Import] insertFromMarkdown returned false for ${file.name}`);
+                            }
                         } catch (error) {
-                            console.error(`[Import] insertMarkdown failed for ${file.name}:`, error);
+                            console.error(`[Import] insertFromMarkdown failed for ${file.name}:`, error);
                         }
                     }
 
@@ -3010,276 +3024,6 @@ class Plugin extends AppPlugin {
         }
 
         return value;
-    }
-
-    convertMarkdown(markdown, source = 'obsidian') {
-        let converted = markdown;
-
-        if (source === 'logseq') {
-            converted = converted.replace(/^(\s*)[-*]\s*TODO\s+(.*)$/gmi, '$1- [ ] $2');
-            converted = converted.replace(/^(\s*)[-*]\s*DONE\s+(.*)$/gmi, '$1- [x] $2');
-        }
-
-        converted = converted.replace(/^>\s*\[!(\w+)\]\s*(.*)$/gm, (match, type, title) => {
-            return `> **${type}${title ? ': ' + title : ''}**`;
-        });
-
-        converted = converted.replace(/==([^=]+)==/g, '**$1**');
-        converted = converted.replace(/%%[^%]*%%/g, '');
-        converted = converted.replace(/!\[\[([^\]]+)\]\]/g, '![Attachment: $1]');
-
-        return converted;
-    }
-
-    // =========================================================================
-    // MARKDOWN INSERTION
-    // =========================================================================
-
-    async insertMarkdown(markdown, targetRecord, afterItem = null) {
-        if (!targetRecord) {
-            console.error('[Import] insertMarkdown: No target record provided');
-            return 0;
-        }
-
-        const record = targetRecord;
-        let promise = Promise.resolve(afterItem);
-        let rendered = 0;
-        let inCode = false, codeLang = '', codeLines = [];
-        let isFirstBlock = true;
-        const BLANK_LINE_BEFORE_HEADINGS = true;
-        
-        const allLines = markdown.split('\n');
-
-        for (let lineIdx = 0; lineIdx < allLines.length; lineIdx++) {
-            const line = allLines[lineIdx];
-            
-            const fenceMatch = line.match(/^(\s*)```(.*)$/);
-            if (fenceMatch) {
-                if (inCode) {
-                    const lang = codeLang, code = [...codeLines];
-                    promise = promise.then(async (last) => {
-                        const block = await record.createLineItem(null, last, 'block');
-                        if (!block) return last;
-                        
-                        try { 
-                            if (lang && block.setHighlightLanguage) {
-                                block.setHighlightLanguage(lang); 
-                            }
-                        } catch(e) {
-                        }
-                        
-                        const codeText = code.join('\n');
-                        try {
-                            await block.setSegments([{ type: 'text', text: codeText }]);
-                        } catch(e) {
-                        }
-                        
-                        rendered++;
-                        return block;
-                    });
-                    inCode = false;
-                    codeLang = '';
-                    codeLines = [];
-                } else {
-                    inCode = true;
-                    codeLang = fenceMatch[2].trim();
-                }
-                continue;
-            }
-
-            if (inCode) {
-                codeLines.push(line);
-                continue;
-            }
-
-            if (!line.trim()) continue;
-
-            const parsed = this.parseLine(line);
-            if (!parsed) {
-                continue;
-            }
-            
-            if (parsed.segments.length === 0) {
-                continue;
-            }
-
-            const { type, segments, level } = parsed;
-            const isHeading = type === 'heading';
-            const needsBlankLine = BLANK_LINE_BEFORE_HEADINGS && isHeading && !isFirstBlock;
-
-            promise = promise.then(async (last) => {
-                try {
-                    let insertAfter = last;
-
-                    if (needsBlankLine) {
-                        const blank = await record.createLineItem(null, insertAfter, 'text');
-                        if (blank) {
-                            blank.setSegments([]);
-                            insertAfter = blank;
-                        }
-                    }
-
-                    let item = null;
-                    for (let attempt = 0; attempt < 3; attempt++) {
-                        item = await record.createLineItem(null, insertAfter, type);
-                        if (item) break;
-                        
-                        if (attempt < 2) {
-                            await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
-                        }
-                    }
-                    
-                    if (!item) {
-                        return last;
-                    }
-
-                    if (isHeading && level > 1) {
-                        try { 
-                            if (item.setHeadingSize) {
-                                item.setHeadingSize(level); 
-                            }
-                        } catch(e) {
-                        }
-                    }
-
-                    try {
-                        await item.setSegments(segments);
-                    } catch (e) {
-                    }
-                    
-                    rendered++;
-                    return item;
-                } catch (error) {
-                    return last;
-                }
-            });
-
-            isFirstBlock = false;
-        }
-
-        await promise;
-        return rendered;
-    }
-
-    parseLine(line) {
-        if (!line.trim()) return null;
-
-        if (/^(\*\s*\*\s*\*|\-\s*\-\s*\-|_\s*_\s*_)[\s\*\-_]*$/.test(line.trim())) {
-            return { type: 'br', segments: [] };
-        }
-
-        const hMatch = line.match(/^(#{1,6})\s+(.+)$/);
-        if (hMatch) {
-            const segments = this.parseInlineFormatting(hMatch[2]);
-            return {
-                type: 'heading',
-                level: hMatch[1].length,
-                segments: segments
-            };
-        }
-
-        const taskMatch = line.match(/^(\s*)[-*]\s+\[([ xX])\]\s+(.+)$/);
-        if (taskMatch) {
-            const content = taskMatch[3].trim();
-            if (!content) {
-                return null;
-            }
-            const segments = this.parseInlineFormatting(taskMatch[3]);
-            return { type: 'task', segments: segments };
-        }
-
-        const ulMatch = line.match(/^(\s*)[-*]\s+(.+)$/);
-        if (ulMatch) {
-            const content = ulMatch[2].trim();
-            if (!content) {
-                return null;
-            }
-            const segments = this.parseInlineFormatting(ulMatch[2]);
-            return { type: 'ulist', segments: segments };
-        }
-
-        const olMatch = line.match(/^(\s*)\d+\.\s+(.+)$/);
-        if (olMatch) {
-            const content = olMatch[2].trim();
-            if (!content) {
-                return null;
-            }
-            const segments = this.parseInlineFormatting(olMatch[2]);
-            return { type: 'olist', segments: segments };
-        }
-
-        if (line.startsWith('> ')) {
-            const content = line.slice(2).trim();
-            if (!content) {
-                return null;
-            }
-            const segments = this.parseInlineFormatting(line.slice(2));
-            return { type: 'quote', segments: segments };
-        }
-
-        const content = line.trim();
-        if (!content) return null;
-        
-        const segments = this.parseInlineFormatting(line);
-        return { type: 'text', segments: segments };
-    }
-
-    parseInlineFormatting(text) {
-        const segments = [];
-        let currentText = '';
-        let i = 0;
-
-        while (i < text.length) {
-            if (text[i] === '`') {
-                if (currentText) {
-                    segments.push({ type: 'text', text: currentText });
-                    currentText = '';
-                }
-                const endIdx = text.indexOf('`', i + 1);
-                if (endIdx !== -1) {
-                    segments.push({ type: 'code', text: text.slice(i + 1, endIdx) });
-                    i = endIdx + 1;
-                    continue;
-                }
-            }
-
-            if ((text[i] === '*' && text[i + 1] === '*') || (text[i] === '_' && text[i + 1] === '_')) {
-                if (currentText) {
-                    segments.push({ type: 'text', text: currentText });
-                    currentText = '';
-                }
-                const marker = text.slice(i, i + 2);
-                const endIdx = text.indexOf(marker, i + 2);
-                if (endIdx !== -1) {
-                    segments.push({ type: 'bold', text: text.slice(i + 2, endIdx) });
-                    i = endIdx + 2;
-                    continue;
-                }
-            }
-
-            if (text[i] === '*' || text[i] === '_') {
-                if (currentText) {
-                    segments.push({ type: 'text', text: currentText });
-                    currentText = '';
-                }
-                const marker = text[i];
-                const endIdx = text.indexOf(marker, i + 1);
-                if (endIdx !== -1) {
-                    segments.push({ type: 'italic', text: text.slice(i + 1, endIdx) });
-                    i = endIdx + 1;
-                    continue;
-                }
-            }
-
-            currentText += text[i];
-            i++;
-        }
-
-        if (currentText) {
-            segments.push({ type: 'text', text: currentText });
-        }
-
-        return segments.length > 0 ? segments : [{ type: 'text', text: text }];
     }
 
     showToast(message, time) {
