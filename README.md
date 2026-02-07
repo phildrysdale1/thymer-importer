@@ -32,13 +32,6 @@ Currently supports CSV, Markdown (Obsidian & Logseq), and daily notes to Journal
 - **Safe Processing**: Excludes code blocks and inline code, preserves all formatting
 - **Batch Updates**: Efficiently processes multiple links per record
 
-### 🎯 One-Click Experience
-- No more two-stage imports
-- No typing collection names - use dropdowns
-- Visual folder selection
-- Real-time progress updates
-- Comprehensive error handling
-
 ## Current Limitations
 - Cannot import attachments
 - Will not render markdown with unsupported equivalent in Thymer, e.g. tables, dividers. (for table support in Thymer see [Thymer Tables](https://github.com/phildrysdale1/thymer-tables/))
