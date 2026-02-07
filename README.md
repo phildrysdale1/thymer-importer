@@ -1,7 +1,7 @@
 # Thymer Importer Plugin
 
 An import plugin that brings your data into Thymer from multiple sources with a streamlined interface.
-Currently supports CSV & Markdown (specifically trained on Obsidian). 
+Currently supports CSV, Markdown (Obsidian & Logseq), and daily notes to Journal.
 
 ## Features
 
@@ -12,13 +12,25 @@ Currently supports CSV & Markdown (specifically trained on Obsidian).
 - **Auto-Create Collections**: Creates new collections with proper schemas or imports to existing ones
 - **Choice Field Detection**: Automatically identifies and configures dropdown fields with all unique values
 
-### 📝 Markdown Import for Obsidian (& Logseq MD beta)
+### 📝 Markdown Import for Obsidian & Logseq
 - **Bulk Import**: Import entire vaults of markdown files in one operation
 - **Frontmatter Parsing**: Extracts YAML frontmatter as properties
 - **Smart Property Detection**: Analyzes your notes to detect field types automatically
 - **Folder Organization**: Preserves folder structure as a choice field
 - **Wiki-Link Resolution**: Converts `[[Note Name]]` syntax to actual Thymer record references
 - **Obsidian Syntax Support**: Handles callouts, highlights, and other Obsidian-specific markdown
+
+### 📅 Daily Notes to Journal (New!)
+- **Direct Journal Import**: Import Obsidian daily notes or Logseq journals directly to Thymer's Journal
+- **Multiple Date Formats**: Supports `YYYY-MM-DD`, `YYYYMMDD`, `DD-MM-YYYY`, and Logseq's `YYYY_MM_DD` format
+- **Smart Updates**: Creates new journal entries or updates existing ones for the same date
+- **One-Click Process**: Select source (Obsidian/Logseq), pick folder, and import
+
+### 🔗 Fix Broken Wikilinks (New!)
+- **Workspace-Wide Scan**: Finds all unresolved `[[wikilinks]]` and `((block-refs))` across your workspace
+- **Smart Resolution**: Automatically fixes single-match links, prompts for disambiguation when multiple matches exist
+- **Safe Processing**: Excludes code blocks and inline code, preserves all formatting
+- **Batch Updates**: Efficiently processes multiple links per record
 
 ### 🎯 One-Click Experience
 - No more two-stage imports
@@ -29,7 +41,7 @@ Currently supports CSV & Markdown (specifically trained on Obsidian).
 
 ## Current Limitations
 - Cannot import attachments
-- Will not render markdown with unsupported equivalent in Thymer, e.g. tables, dividers.
+- Will not render markdown with unsupported equivalent in Thymer, e.g. tables, dividers. (for table support in Thymer see [Thymer Tables](https://github.com/phildrysdale1/thymer-tables/))
  
 ## Coming soon: 
 - Google Keep
@@ -40,8 +52,8 @@ Currently supports CSV & Markdown (specifically trained on Obsidian).
 
 ## Installation
 
-1. In Thymer, create a new **Global Plugin**
-2. Copy the contents of `unified-import-plugin.js`
+1. In Thymer, create a new **App Plugin** (not Collection Plugin)
+2. Copy the contents of `plugin.js`
 3. Paste into the plugin editor
 4. Save and enable the plugin
 
@@ -49,7 +61,7 @@ Currently supports CSV & Markdown (specifically trained on Obsidian).
 
 ### CSV Import
 
-1. Run the **Import Data** command from the command palette
+1. Run the **Import Data (CSV or Markdown)** command from the command palette
 2. Select **CSV Import**
 3. Choose to create a new collection or select an existing one
 4. Paste CSV data or upload a CSV file
@@ -69,9 +81,9 @@ Bob,25,Pending,2024-02-20
 
 Supported types: `text`, `number`, `datetime`, `checkbox`, `choice`, `url`
 
-### Markdown Import
+### Markdown Import (Obsidian/Logseq)
 
-1. Run the **Import Data** command from the command palette
+1. Run the **Import Data (CSV or Markdown)** command from the command palette
 2. Select **Markdown Import**
 3. Choose from **Obsidian** or **Logseq**
 4. Choose to create a new collection or select an existing one
@@ -79,12 +91,34 @@ Supported types: `text`, `number`, `datetime`, `checkbox`, `choice`, `url`
 6. Review detected properties and adjust types as needed
 7. Click **Import**
 
-The plugin will:
+The command will:
 - Scan all `.md` files
 - Analyze frontmatter to detect properties
 - Create the collection with detected schema
 - Import all markdown content
 - Resolve wiki-links to actual record references
+
+### Daily Notes to Journal
+
+1. Ensure the **Journal** feature is enabled in Thymer
+2. Run the **Import Daily Notes to Journal** command
+3. Select source: **Obsidian Daily Notes** or **Logseq Journals**
+4. Select your folder (daily notes folder or Logseq graph root)
+5. Confirm the import
+
+The command will:
+- Scan for date-formatted files (`2024-01-15.md`, `2024_01_15.md`, etc.)
+- Parse each file's markdown content
+- Create or update journal entries for each date
+- Preserve all formatting and wiki-links
+
+### Fix Broken Wikilinks
+
+1. Run the **Fix broken [[wikilinks]]** command
+2. Plugin scans your entire workspace for unresolved links
+3. For links with one match: automatically fixed
+4. For links with multiple matches: choose the correct target
+5. Review the summary of fixed/skipped links
 
 #### Example Markdown File
 
@@ -171,12 +205,23 @@ The plugin uses Thymer's segments API to convert wiki-links:
 - Common field names (`created`, `modified`, `tags`) are auto-detected
 - Test with a small subset first to verify property types
 
+### For Daily Notes to Journal
+- Obsidian: Daily notes can be in any folder with date-formatted filenames
+- Logseq: Point to your graph root - the plugin will find the `journals` folder
+- Supported formats: `YYYY-MM-DD`, `YYYYMMDD`, `DD-MM-YYYY`, `MM-DD-YYYY`, `YYYY_MM_DD`
+- Existing journal entries are updated, not duplicated
+
 ### Performance
 - CSV: Handles thousands of rows smoothly
 - Markdown: Processes 500+ notes efficiently
+- Journal Import: Processes hundreds of daily notes
 - Progress indicators show status for large imports
 
 ## Troubleshooting
+
+### "Journal plugin not found"
+- Make sure the Journal feature is enabled in Thymer
+- The Journal must be set up before importing daily notes
 
 ### "No markdown content imported"
 - Check that your files have content below the frontmatter
@@ -192,19 +237,25 @@ The plugin uses Thymer's segments API to convert wiki-links:
 - Ensure target notes exist in the collection
 - Check that note titles match exactly (case-insensitive)
 - Wiki-links are resolved in Phase 3 (final step)
+- Use the "Fix broken [[wikilinks]]" command after import
 
 ### "Property types are wrong"
 - You can adjust them in the configuration dialog
 - For CSV: Use type hints in row 2
 - For Markdown: Common date fields are auto-detected
 
+### Plugin appears as Collection Plugin instead of App Plugin
+- Delete the plugin completely
+- Clear browser cache (F12 → Application → Clear site data)
+- Refresh Thymer
+- Create a new **App Plugin** (not Collection Plugin)
+- Paste the code and save
+
 ## Technical Details
 
-- **Version**: 1.0.0
-- **Type**: Global Plugin (AppPlugin)
+- **Type**: App Plugin (AppPlugin)
 - **Dependencies**: None (self-contained)
-- **Storage**: Uses Thymer's native file system APIs
-- **API**: Uses Thymer's Collection API and Data API
+
 
 ## Contributing
 
