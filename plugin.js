@@ -1,8 +1,13 @@
-const VERSION = 'v0.0.7';
+const VERSION = 'v0.0.12';
 /**
  * Unified Import Plugin for Thymer
- * Supports CSV, Obsidian Markdown, and Logseq imports with UI
+ * Supports CSV, Obsidian Markdown, Joplin (YAML frontmatter), and Logseq imports with UI
  * 
+ * v0.0.12 - Create New Collection: frontmatter keys tag / tags get property type hashtag (many: true when values are YAML lists)
+ * v0.0.11 - Markdown folder picker: use pickFolder() like journal import (showDirectoryPicker without startIn + webkitdirectory fallback for Safari/macOS); scanVaultFiles supports file-list result
+ * v0.0.10 - Optional plugin.json custom.markdown_import_hashtag_escape (default true): set false to disable v0.0.9 hashtag-like token escaping
+ * v0.0.9 - Markdown import inserts U+200C after # before numeric tokens and 6-digit hex colors (outside headings / code) so Thymer does not treat those as hashtags; #word tags still import as hashtags; insertFromMarkdown has no escape flag in the SDK
+ * v0.0.8 - Joplin (YAML) source: CRLF-safe frontmatter, ISO datetimes via setFromDate, multi-value fields (tags) using prop.set / setChoice when many: true; Joplin key aliases updated_at / created_at; new collections infer many: true for YAML arrays
  * v0.0.7 - Added an option to autodetect (or select folder) for journal entries in import and automatically import them into your Thymer Journal collection
  * v0.0.6 - Added "Import Daily Notes to Journal" command
  * v0.0.5 - Added "Fix broken [[wikilinks]]" command
@@ -226,14 +231,17 @@ class Plugin extends AppPlugin {
 
     async pickFolder() {
         try {
-            if (window.showDirectoryPicker) {
-                return await window.showDirectoryPicker({
-                    mode: 'read',
-                    startIn: 'documents'
-                });
+            if (typeof window.showDirectoryPicker === 'function') {
+                try {
+                    return await window.showDirectoryPicker({ mode: 'read' });
+                } catch (err) {
+                    if (err && err.name === 'AbortError') {
+                        return null;
+                    }
+                    console.warn('[pickFolder] showDirectoryPicker failed, trying webkitdirectory fallback', err);
+                }
             }
 
-            // Fallback for browsers without File System Access API
             const input = document.createElement('input');
             input.type = 'file';
             input.webkitdirectory = true;
@@ -495,12 +503,13 @@ class Plugin extends AppPlugin {
 
                 // Insert the markdown content using the native API
                 if (parsed.markdown) {
-                    console.log(`[Journal Import] Inserting ${parsed.markdown.length} characters of markdown`);
+                    const md = this.prepareMarkdownForThymerImport(parsed.markdown);
+                    console.log(`[Journal Import] Inserting ${md.length} characters of markdown`);
                     
                     try {
                         // Use the native insertFromMarkdown method
                         const success = await journalRecord.insertFromMarkdown(
-                            parsed.markdown,
+                            md,
                             null,  // parentItem: null = use record as parent
                             null   // afterItem: null = insert as first child
                         );
@@ -1821,6 +1830,7 @@ class Plugin extends AppPlugin {
                 <label style="display: block; margin-bottom: 8px; font-weight: 500; color: ${colors.text};">Source:</label>
                 <select id="md-source-select" style="width: 100%; padding: 8px; border: 1px solid ${colors.inputBorder}; border-radius: 4px; background: ${colors.input}; color: ${colors.text};">
                     <option value="obsidian">Obsidian</option>
+                    <option value="joplin">Joplin (YAML)</option>
                     <option value="logseq">Logseq</option>
                 </select>
             </div>
@@ -1845,7 +1855,7 @@ class Plugin extends AppPlugin {
             
             <div style="margin-bottom: 16px;">
                 <label style="display: block; margin-bottom: 8px; font-weight: 500; color: ${colors.text};">Select Folder:</label>
-                <button id="select-folder-btn" style="width: 100%; padding: 12px; border: 2px dashed ${colors.border}; background: ${colors.backgroundSecondary}; color: ${colors.text}; border-radius: 4px; cursor: pointer; text-align: center;">
+                <button type="button" id="select-folder-btn" style="width: 100%; padding: 12px; border: 2px dashed ${colors.border}; background: ${colors.backgroundSecondary}; color: ${colors.text}; border-radius: 4px; cursor: pointer; text-align: center;">
                     📁 Click to select markdown folder
                 </button>
                 <div id="folder-info" style="margin-top: 8px; font-size: 12px; color: ${colors.textSecondary};"></div>
@@ -1907,15 +1917,24 @@ class Plugin extends AppPlugin {
 
         dialog.querySelector('#select-folder-btn').onclick = async () => {
             try {
-                selectedDirHandle = await window.showDirectoryPicker({
-                    mode: 'read',
-                    startIn: 'documents'
-                });
-                
+                const picked = await this.pickFolder();
+                if (!picked) {
+                    return;
+                }
+                selectedDirHandle = picked;
+
                 const folderInfo = dialog.querySelector('#folder-info');
-                folderInfo.textContent = `✓ Selected: ${selectedDirHandle.name}`;
+                if (picked.kind === 'filelist') {
+                    const n = picked.files ? picked.files.length : 0;
+                    folderInfo.textContent = `✓ Folder selected (${n} file(s); macOS/Safari uses file chooser)`;
+                } else {
+                    const label = picked.name && String(picked.name).trim()
+                        ? picked.name
+                        : 'Folder';
+                    folderInfo.textContent = `✓ Selected: ${label}`;
+                }
                 folderInfo.style.color = colors.success;
-                
+
                 this.updateImportButtonState(importBtn, collectionSelect, selectedDirHandle);
             } catch (error) {
                 if (error.name !== 'AbortError') {
@@ -1993,6 +2012,17 @@ class Plugin extends AppPlugin {
         this.showStatus(statusDiv, 'Scanning files...', 'info');
 
         try {
+            if (source === 'logseq' && dirHandle && dirHandle.kind === 'filelist') {
+                this.showStatus(
+                    statusDiv,
+                    'Logseq import needs the native folder dialog (pages/journals). Use Chrome/Edge or Thymer builds with showDirectoryPicker, or choose Obsidian/Joplin for this folder.',
+                    'error'
+                );
+                importBtn.disabled = false;
+                importBtn.textContent = 'Import';
+                return;
+            }
+
             const scanResults = source === 'logseq' 
                 ? await this.scanLogseqFiles(dirHandle)
                 : await this.scanVaultFiles(dirHandle);
@@ -2229,8 +2259,9 @@ class Plugin extends AppPlugin {
 
                 // Insert markdown content
                 if (parsed.markdown) {
+                    const md = this.prepareMarkdownForThymerImport(parsed.markdown);
                     const success = await journalRecord.insertFromMarkdown(
-                        parsed.markdown,
+                        md,
                         null,
                         null
                     );
@@ -2301,7 +2332,7 @@ class Plugin extends AppPlugin {
                 label: prop.key,
                 type: prop.recommendedType?.type || 'text',
                 icon: this.getFieldIcon(prop.recommendedType?.type || 'text'),
-                many: false,
+                many: prop.recommendedType?.many === true,
                 read_only: false,
                 active: true
             });
@@ -2382,6 +2413,7 @@ class Plugin extends AppPlugin {
             'datetime': 'ti-clock',
             'checkbox': 'ti-checkbox',
             'choice': 'ti-tag',
+            'hashtag': 'ti-hash',
             'url': 'ti-link'
         };
         return iconMap[fieldType] || 'ti-abc';
@@ -2471,6 +2503,10 @@ class Plugin extends AppPlugin {
     // =========================================================================
 
     async scanVaultFiles(dirHandle) {
+        if (dirHandle && dirHandle.kind === 'filelist') {
+            return this.scanVaultFilesFromFileList(dirHandle);
+        }
+
         const files = [];
         const topFolders = new Set();
 
@@ -2485,6 +2521,51 @@ class Plugin extends AppPlugin {
         return { 
             files, 
             topFolders: Array.from(topFolders).sort() 
+        };
+    }
+
+    /**
+     * Build vault file list from <input webkitdirectory> (File[]) when showDirectoryPicker is unavailable.
+     */
+    scanVaultFilesFromFileList(fileListResult) {
+        const files = [];
+        const topFolders = new Set();
+        const list = fileListResult.files || [];
+
+        for (const file of list) {
+            if (!file || !file.name || !file.name.toLowerCase().endsWith('.md')) {
+                continue;
+            }
+            const relPath = file.webkitRelativePath || file.name;
+            const parts = relPath.split('/').filter(Boolean);
+            if (parts.length === 0) {
+                continue;
+            }
+            const baseName = parts[parts.length - 1];
+            if (!baseName.toLowerCase().endsWith('.md')) {
+                continue;
+            }
+
+            let topFolder = 'Root';
+            if (parts.length > 1) {
+                topFolder = parts[0];
+                topFolders.add(parts[0]);
+            }
+
+            const fullPath = parts.join('/');
+            const name = baseName.replace(/\.md$/i, '');
+
+            files.push({
+                handle: file,
+                path: fullPath,
+                name: name,
+                topFolder: topFolder
+            });
+        }
+
+        return {
+            files,
+            topFolders: Array.from(topFolders).sort()
         };
     }
 
@@ -2594,7 +2675,7 @@ class Plugin extends AppPlugin {
                 key,
                 count: stat.count,
                 percentage: Math.round((stat.count / filesWithFrontmatter) * 100),
-                recommendedType: this.recommendFieldType(stat.types, stat.samples)
+                recommendedType: this.recommendFieldType(stat.types, stat.samples, key)
             }))
             .sort((a, b) => b.count - a.count);
 
@@ -2649,7 +2730,7 @@ class Plugin extends AppPlugin {
                 key,
                 count: stat.count,
                 percentage: filesWithProps === 0 ? 0 : Math.round((stat.count / filesWithProps) * 100),
-                recommendedType: this.recommendFieldType(stat.types, stat.samples)
+                recommendedType: this.recommendFieldType(stat.types, stat.samples, key)
             }))
             .sort((a, b) => b.count - a.count);
 
@@ -2673,11 +2754,22 @@ class Plugin extends AppPlugin {
         return 'unknown';
     }
 
-    recommendFieldType(types, samples) {
+    recommendFieldType(types, samples, key) {
+        const k = String(key || '').trim().toLowerCase();
+        if (k === 'tag' || k === 'tags') {
+            const typeArray = Array.from(types);
+            const many = typeArray.includes('array');
+            return {
+                type: 'hashtag',
+                note: many ? 'Tags (hashtag)' : 'Tag (hashtag)',
+                many: many
+            };
+        }
+
         const typeArray = Array.from(types);
         
         if (typeArray.includes('array')) {
-            return { type: 'text', note: 'Arrays → comma-separated' };
+            return { type: 'text', note: 'Multi-value list (e.g. tags)', many: true };
         }
         
         if (typeArray.includes('date')) {
@@ -2726,14 +2818,79 @@ class Plugin extends AppPlugin {
     }
 
     parseMarkdownFile(content) {
-        const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+        const normalized = String(content)
+            .replace(/^\uFEFF/, '')
+            .replace(/\r\n/g, '\n')
+            .replace(/\r/g, '\n');
+        const frontmatterMatch = normalized.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
         if (frontmatterMatch) {
             return { 
                 frontmatter: this.parseYAML(frontmatterMatch[1]), 
                 markdown: frontmatterMatch[2].trim() 
             };
         }
-        return { frontmatter: {}, markdown: content.trim() };
+        return { frontmatter: {}, markdown: normalized.trim() };
+    }
+
+    /**
+     * Controlled by plugin.json `custom.markdown_import_hashtag_escape` (default true).
+     * Set to false to pass markdown through unchanged for insertFromMarkdown.
+     */
+    isMarkdownImportHashtagEscapeEnabled() {
+        try {
+            const conf = this.getConfiguration();
+            const v = conf && conf.custom && conf.custom.markdown_import_hashtag_escape;
+            return v !== false;
+        } catch (e) {
+            return true;
+        }
+    }
+
+    /**
+     * insertFromMarkdown has no option to disable hashtag detection; the SDK stores
+     * "#…" as hashtag segments. Insert U+200C after "#" only when it looks like a number
+     * or 6-digit hex color, so "issue #123" and "#aabbcc" stay plain text while "#tag"
+     * imports still become Thymer hashtags. Skips fenced ``` code ```, inline `code`,
+     * and ATX heading lines (leading #{1,6} + space).
+     */
+    prepareMarkdownForThymerImport(markdown) {
+        if (markdown == null || typeof markdown !== 'string' || markdown.length === 0) {
+            return markdown;
+        }
+        if (!this.isMarkdownImportHashtagEscapeEnabled()) {
+            return markdown;
+        }
+        const parts = markdown.split(/(```[\s\S]*?```)/g);
+        return parts.map((chunk) => {
+            if (chunk.startsWith('```')) {
+                return chunk;
+            }
+            return this.escapeThymerHashtagTokensInMarkdownChunk(chunk);
+        }).join('');
+    }
+
+    escapeThymerHashtagTokensInMarkdownChunk(text) {
+        const lines = text.split('\n');
+        return lines.map((line) => {
+            const heading = line.match(/^(\s{0,3})(#{1,6})(\s)(.*)$/);
+            if (heading) {
+                return heading[1] + heading[2] + heading[3]
+                    + this.escapeThymerHashtagRunsOutsideInlineCode(heading[4]);
+            }
+            return this.escapeThymerHashtagRunsOutsideInlineCode(line);
+        }).join('\n');
+    }
+
+    escapeThymerHashtagRunsOutsideInlineCode(line) {
+        const pieces = line.split(/(`[^`]*`)/g);
+        return pieces.map((piece) => {
+            if (piece.length >= 2 && piece[0] === '`' && piece[piece.length - 1] === '`') {
+                return piece;
+            }
+            return piece
+                .replace(/(?<![A-Za-z0-9_])#(?=[a-fA-F0-9]{6}\b)/gi, '#\u200c')
+                .replace(/(?<![A-Za-z0-9_])#(?=\d)/g, '#\u200c');
+        }).join('');
     }
 
     parseLogseqFile(content) {
@@ -2919,6 +3076,7 @@ class Plugin extends AppPlugin {
                     this.setFieldValue(existing, 'source', source);
                     for (const [key, value] of Object.entries(parsed.frontmatter)) {
                         if (value === null || value === undefined || value === '') continue;
+                        if (Array.isArray(value) && value.length === 0) continue;
                         this.setFrontmatterField(existing, key, value);
                     }
                     if (source === 'logseq') {
@@ -2933,7 +3091,8 @@ class Plugin extends AppPlugin {
                             if (textProp) textProp.set('');
                             
                             // Use native insertFromMarkdown
-                            const success = await existing.insertFromMarkdown(parsed.markdown, null, null);
+                            const md = this.prepareMarkdownForThymerImport(parsed.markdown);
+                            const success = await existing.insertFromMarkdown(md, null, null);
                             if (!success) {
                                 console.error(`[Import] insertFromMarkdown returned false for ${existing.getName()}`);
                             }
@@ -2969,6 +3128,7 @@ class Plugin extends AppPlugin {
                     this.setFieldValue(record, 'source', source);
                     for (const [key, value] of Object.entries(parsed.frontmatter)) {
                         if (value === null || value === undefined || value === '') continue;
+                        if (Array.isArray(value) && value.length === 0) continue;
                         this.setFrontmatterField(record, key, value);
                     }
                     if (source === 'logseq') {
@@ -2978,7 +3138,8 @@ class Plugin extends AppPlugin {
                     if (parsed.markdown) {
                         try {
                             // Use native insertFromMarkdown
-                            const success = await record.insertFromMarkdown(parsed.markdown, null, null);
+                            const md = this.prepareMarkdownForThymerImport(parsed.markdown);
+                            const success = await record.insertFromMarkdown(md, null, null);
                             if (!success) {
                                 console.error(`[Import] insertFromMarkdown returned false for ${file.name}`);
                             }
@@ -3185,6 +3346,9 @@ class Plugin extends AppPlugin {
 
     setFrontmatterField(record, frontmatterKey, value) {
         const transformedValue = this.transformValue(value);
+        if (Array.isArray(transformedValue) && transformedValue.length === 0) {
+            return false;
+        }
         const variations = this.getFieldVariations(frontmatterKey);
         
         for (const fieldId of variations) {
@@ -3204,6 +3368,18 @@ class Plugin extends AppPlugin {
         variations.push(key.toLowerCase());
         variations.push(key.toLowerCase().replace(/\s+/g, '_'));
         variations.push(key.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase());
+
+        const joplinAliases = {
+            updated: ['updated_at'],
+            created: ['created_at']
+        };
+        const extra = joplinAliases[key.toLowerCase()];
+        if (extra) {
+            for (const alias of extra) {
+                variations.push(alias);
+                variations.push(this.slugify(alias));
+            }
+        }
         
         return [...new Set(variations)];
     }
@@ -3213,20 +3389,60 @@ class Plugin extends AppPlugin {
             const prop = record.prop(fieldId);
             if (!prop) return false;
 
-            if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) {
+            if (Array.isArray(value)) {
+                const cleaned = value.filter(v => v !== null && v !== undefined && v !== '');
+                if (cleaned.length === 0) return false;
+                const multi = typeof prop.isMultiValue === 'function' && prop.isMultiValue();
+                if (multi) {
+                    try {
+                        if (typeof prop.setChoice === 'function' && prop.setChoice(cleaned)) {
+                            return true;
+                        }
+                    } catch (e) {
+                    }
+                    try {
+                        prop.set(cleaned);
+                        return true;
+                    } catch (e) {
+                    }
+                }
                 try {
-                    const dateOnly = value.match(/^\d{4}-\d{2}-\d{2}/)[0];
-                    const [year, month, day] = dateOnly.split('-');
-                    
-                    prop.set({
-                        d: year + month + day
-                    });
+                    if (cleaned.length === 1 && typeof prop.setChoice === 'function' && prop.setChoice(cleaned[0])) {
+                        return true;
+                    }
+                } catch (e) {
+                }
+                try {
+                    prop.set(cleaned.join(', '));
                     return true;
                 } catch (e) {
+                    return false;
+                }
+            }
+
+            if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) {
+                const parsed = new Date(value);
+                if (!isNaN(parsed.getTime())) {
                     try {
-                        prop.set(value);
+                        if (typeof prop.setFromDate === 'function') {
+                            prop.setFromDate(parsed);
+                            return true;
+                        }
+                    } catch (e) {
+                    }
+                    try {
+                        const dateOnly = value.match(/^\d{4}-\d{2}-\d{2}/)[0];
+                        const [year, month, day] = dateOnly.split('-');
+                        prop.set({
+                            d: year + month + day
+                        });
                         return true;
-                    } catch (e2) {
+                    } catch (e) {
+                        try {
+                            prop.set(value);
+                            return true;
+                        } catch (e2) {
+                        }
                     }
                 }
             }
@@ -3256,7 +3472,7 @@ class Plugin extends AppPlugin {
         }
         
         if (Array.isArray(value)) {
-            return value.filter(v => v !== null && v !== undefined && v !== '').join(', ');
+            return value.filter(v => v !== null && v !== undefined && v !== '');
         }
 
         return value;

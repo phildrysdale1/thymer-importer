@@ -2,5 +2,28 @@
 	"ver": 1,
 	"name": "Thymer Importer",
 	"icon": "ti-download",
-	"description": "Import notes from other note apps"
+	"item_name": "Note",
+	"description": "Import notes from other note apps",
+	"show_sidebar_items": true,
+	"show_cmdpal_items": true,
+	"views": [],
+	"fields": [],
+	"page_field_ids": [],
+	"sidebar_record_sort_field_id": "updated_at",
+	"sidebar_record_sort_dir": "desc",
+	"managed": {
+		"fields": false,
+		"views": false,
+		"sidebar": false
+	},
+	"custom": {
+		"markdown_import_hashtag_escape": true
+	},
+	"home": false,
+	"__source_repo": "https://github.com/phildrysdale1/thymer-importer",
+	"__source_files": {
+		"branch": "main",
+		"json": "plugin.json",
+		"js": "plugin.js"
+	}
 }
