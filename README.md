@@ -1,6 +1,6 @@
 # Thymer Importer Plugin
 
-A powerful import plugin for Thymer that brings your data from CSV, Obsidian, and Logseq into Thymer with a streamlined, intelligent workflow.
+A powerful import plugin for Thymer that brings your data from CSV, Obsidian, Logseq and Joplin into Thymer with a streamlined, intelligent workflow.
 
 ## Features
 
