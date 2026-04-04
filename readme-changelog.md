@@ -1,6 +1,37 @@
 # Changelog — Thymer Importer
 
-Tracks **`plugin.js`** / **`plugin.json`** behavior. Current release: **v0.0.12** (see **`VERSION`** in **`plugin.js`**).
+Tracks **`plugin.js`** / **`plugin.json`** behavior. Current release: **v0.0.14** (see **`VERSION`** in **`plugin.js`**).
+
+---
+
+## v0.0.14 — Supernotes **`(^uuid)`** preview links + Import Data menu copy
+
+### Supernotes: **`link_cache`** in markup / HTML
+
+Some Supernotes markup uses **`(^<uuid>)`**. Each note’s **`data.link_cache`** maps that UUID to a display label (e.g. **`"Guam"`**). On import, those tokens are rewritten to a Markdown link:
+
+**`[label](https://my.supernotes.app/entry/web?preview=<uuid>)`**
+
+- Runs on **markup** first, then **`prepareMarkdownForThymerImport`** (hashtag-like escaping), then **`insertFromMarkdown`**.
+- The same replacement runs on the **HTML fallback** string when markup is empty.
+- If **`link_cache`** is missing or not an object, text is unchanged. If a UUID has no label, the UUID is used as link text. **`[`** / **`]`** / **`\`** in labels are escaped for Markdown.
+
+### Import Data menu
+
+- The markdown option label is **Markdown Import (Obsidian/Logseq/Joplin)**; subtitle mentions **Obsidian, Logseq, or Joplin** vaults.
+
+---
+
+## v0.0.13 — Supernotes JSON import
+
+- Command palette: **Import Supernotes JSON**; **Import Data** dialog includes **Supernotes JSON**.
+- File picker for **`.json`** export (top-level object keyed by note UUID; each value has **`data`**, etc.).
+- **Body:** **`data.markup`** when non-empty after trim; otherwise **`data.html`** ( **`insertFromHtml` / `insertFromHTML`** if available, else plain text derived from HTML → **`insertFromMarkdown`**).
+- **Tags:** **`data.tags`** → property **`supernotes_tags`** (**hashtag**, **`many: true`**). Re-import clears tags when export has none.
+- **Dedup / updates:** match by **`supernotes_id`** (**`data.id`**); re-import updates existing records.
+- **Collections:** **Create New Collection** builds Supernotes fields (**`supernotes_id`**, **`supernotes_tags`**, **`supernotes_created`**, **`supernotes_updated`**, **`supernotes_daily_date`**, **`supernotes_source`**). Importing into an **existing** collection **adds** any missing fields via **`ensureSupernotesFields`**.
+- **Daily notes:** all notes go into the **selected** collection (no Journal routing); **`daily_date`** is stored on **`supernotes_daily_date`** when present.
+- **Progress:** status updates during large imports; then **wiki-style link** resolution (same helper as markdown import).
 
 ---
 

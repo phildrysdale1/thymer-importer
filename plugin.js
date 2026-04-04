@@ -1,8 +1,10 @@
-const VERSION = 'v0.0.12';
+const VERSION = 'v0.0.14';
 /**
  * Unified Import Plugin for Thymer
  * Supports CSV, Obsidian Markdown, Joplin (YAML frontmatter), and Logseq imports with UI
  * 
+ * v0.0.14 - Supernotes: expand markup (^preview-guid) using data.link_cache to [label](https://my.supernotes.app/entry/web?preview=…); same for HTML fallback text
+ * v0.0.13 - Supernotes JSON import: markup body with HTML fallback; tags → hashtag field; dedup by supernotes_id; batched progress; file picker for .json
  * v0.0.12 - Create New Collection: frontmatter keys tag / tags get property type hashtag (many: true when values are YAML lists)
  * v0.0.11 - Markdown folder picker: use pickFolder() like journal import (showDirectoryPicker without startIn + webkitdirectory fallback for Safari/macOS); scanVaultFiles supports file-list result
  * v0.0.10 - Optional plugin.json custom.markdown_import_hashtag_escape (default true): set false to disable v0.0.9 hashtag-like token escaping
@@ -28,6 +30,12 @@ class Plugin extends AppPlugin {
                 label: 'Import Data (CSV or Markdown)',
                 icon: 'ti-file-import',
                 onSelected: () => this.showImportTypeDialog()
+            });
+
+            this.ui.addCommandPaletteCommand({
+                label: 'Import Supernotes JSON',
+                icon: 'ti-notes',
+                onSelected: () => this.showSupernotesImportDialog()
             });
 
             this.ui.addCommandPaletteCommand({
@@ -970,9 +978,25 @@ class Plugin extends AppPlugin {
                     text-align: left;
                     transition: all 0.2s;
                 ">
-                    <div style="font-weight: 600; margin-bottom: 4px;">📝 Markdown Import (Obsidian/Logseq)</div>
+                    <div style="font-weight: 600; margin-bottom: 4px;">📝 Markdown Import (Obsidian/Logseq/Joplin)</div>
                     <div style="font-size: 13px; color: ${colors.textSecondary};">
-                        Import from Obsidian or Logseq vaults
+                        Import from Obsidian, Logseq, or Joplin vaults
+                    </div>
+                </button>
+                <button id="supernotes-import-btn" style="
+                    padding: 20px;
+                    background: ${colors.backgroundSecondary};
+                    color: ${colors.text};
+                    border: 2px solid ${colors.border};
+                    border-radius: 8px;
+                    font-size: 16px;
+                    cursor: pointer;
+                    text-align: left;
+                    transition: all 0.2s;
+                ">
+                    <div style="font-weight: 600; margin-bottom: 4px;">📇 Supernotes JSON</div>
+                    <div style="font-size: 13px; color: ${colors.textSecondary};">
+                        Import a Supernotes export (.json) into one collection
                     </div>
                 </button>
             </div>
@@ -1004,6 +1028,7 @@ class Plugin extends AppPlugin {
 
         addHoverEffects(dialog.querySelector('#csv-import-btn'));
         addHoverEffects(dialog.querySelector('#markdown-import-btn'));
+        addHoverEffects(dialog.querySelector('#supernotes-import-btn'));
 
         dialog.querySelector('#csv-import-btn').onclick = () => {
             document.body.removeChild(overlay);
@@ -1013,6 +1038,11 @@ class Plugin extends AppPlugin {
         dialog.querySelector('#markdown-import-btn').onclick = () => {
             document.body.removeChild(overlay);
             this.showMarkdownImportDialog();
+        };
+
+        dialog.querySelector('#supernotes-import-btn').onclick = () => {
+            document.body.removeChild(overlay);
+            this.showSupernotesImportDialog();
         };
 
         dialog.querySelector('#cancel-btn').onclick = () => {
@@ -1961,6 +1991,196 @@ class Plugin extends AppPlugin {
         };
     }
 
+    // =========================================================================
+    // SUPERNOTES JSON IMPORT
+    // =========================================================================
+
+    showSupernotesImportDialog() {
+        const colors = this.getThemeColors();
+
+        const overlay = document.createElement('div');
+        overlay.style.cssText = `
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 10000;
+        `;
+
+        const dialog = document.createElement('div');
+        dialog.style.cssText = `
+            background: ${colors.background};
+            color: ${colors.text};
+            border-radius: 8px;
+            padding: 24px;
+            width: 90%;
+            max-width: 560px;
+            max-height: 80vh;
+            overflow-y: auto;
+            border: 1px solid ${colors.border};
+        `;
+
+        dialog.innerHTML = `
+            <h2 style="margin: 0 0 16px 0; color: ${colors.text};">Import Supernotes JSON</h2>
+            <p style="margin: 0 0 16px 0; font-size: 14px; color: ${colors.textSecondary}; line-height: 1.5;">
+                Choose a Supernotes export file. Notes use <strong>markup</strong> for the body; if markup is empty, <strong>HTML</strong> is used.
+                Re-importing the same file updates existing notes matched by <code>supernotes_id</code>.
+            </p>
+            <div style="margin-bottom: 16px;">
+                <label style="display: block; margin-bottom: 8px; font-weight: 500; color: ${colors.text};">Collection:</label>
+                <select id="sn-collection-select" style="width: 100%; padding: 8px; border: 1px solid ${colors.inputBorder}; border-radius: 4px; background: ${colors.input}; color: ${colors.text};">
+                    <option value="">-- Select a collection --</option>
+                    <option value="__CREATE_NEW__">✨ Create New Collection</option>
+                </select>
+            </div>
+            <div id="sn-new-collection-name-container" style="margin-bottom: 16px; display: none;">
+                <label style="display: block; margin-bottom: 8px; font-weight: 500; color: ${colors.text};">New collection name:</label>
+                <input type="text" id="sn-new-collection-name" placeholder="e.g. Supernotes"
+                    style="width: 100%; padding: 8px; border: 1px solid ${colors.inputBorder}; border-radius: 4px; background: ${colors.input}; color: ${colors.text};">
+            </div>
+            <div style="margin-bottom: 16px;">
+                <label style="display: block; margin-bottom: 8px; font-weight: 500; color: ${colors.text};">Export file (.json):</label>
+                <input type="file" id="sn-json-file" accept=".json,application/json"
+                    style="width: 100%; font-size: 14px; color: ${colors.text};">
+            </div>
+            <div style="display: flex; gap: 8px; justify-content: flex-end;">
+                <button id="sn-cancel-btn" style="padding: 8px 16px; border: 1px solid ${colors.buttonBorder}; background: ${colors.buttonBg}; color: ${colors.buttonText}; border-radius: 4px; cursor: pointer;">Cancel</button>
+                <button id="sn-import-btn" style="padding: 8px 16px; border: none; background: ${colors.primary}; color: #fff; border-radius: 4px; cursor: pointer;" disabled>Import</button>
+            </div>
+            <div id="sn-status" style="margin-top: 16px; padding: 12px; border-radius: 4px; display: none;"></div>
+        `;
+
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        this.loadCollections(dialog, 'sn-collection-select');
+
+        const collectionSelect = dialog.querySelector('#sn-collection-select');
+        const newNameContainer = dialog.querySelector('#sn-new-collection-name-container');
+        const importBtn = dialog.querySelector('#sn-import-btn');
+        const fileInput = dialog.querySelector('#sn-json-file');
+
+        const refreshImportEnabled = () => {
+            this.updateSupernotesImportButtonState(importBtn, collectionSelect, fileInput);
+        };
+
+        collectionSelect.addEventListener('change', () => {
+            newNameContainer.style.display = collectionSelect.value === '__CREATE_NEW__' ? 'block' : 'none';
+            refreshImportEnabled();
+        });
+
+        fileInput.addEventListener('change', refreshImportEnabled);
+
+        dialog.querySelector('#sn-cancel-btn').onclick = () => {
+            document.body.removeChild(overlay);
+        };
+
+        dialog.querySelector('#sn-import-btn').onclick = () => {
+            this.performSupernotesImport(dialog, overlay);
+        };
+
+        overlay.onclick = (e) => {
+            if (e.target === overlay) {
+                document.body.removeChild(overlay);
+            }
+        };
+    }
+
+    updateSupernotesImportButtonState(importBtn, collectionSelect, fileInput) {
+        const hasFile = fileInput.files && fileInput.files.length > 0;
+        const hasCollection = collectionSelect.value !== '';
+        importBtn.disabled = !(hasFile && hasCollection);
+    }
+
+    async performSupernotesImport(dialog, overlay) {
+        const select = dialog.querySelector('#sn-collection-select');
+        const statusDiv = dialog.querySelector('#sn-status');
+        const importBtn = dialog.querySelector('#sn-import-btn');
+        const fileInput = dialog.querySelector('#sn-json-file');
+        const newNameInput = dialog.querySelector('#sn-new-collection-name');
+
+        const collectionGuid = select.value;
+        const isCreatingNew = collectionGuid === '__CREATE_NEW__';
+
+        if (isCreatingNew) {
+            const name = newNameInput.value.trim();
+            if (!name) {
+                statusDiv.style.display = 'block';
+                this.showStatus(statusDiv, 'Please enter a name for the new collection', 'error');
+                return;
+            }
+        }
+
+        const file = fileInput.files && fileInput.files[0];
+        if (!file) {
+            statusDiv.style.display = 'block';
+            this.showStatus(statusDiv, 'Please choose a JSON file', 'error');
+            return;
+        }
+
+        importBtn.disabled = true;
+        statusDiv.style.display = 'block';
+        this.showStatus(statusDiv, 'Reading file...', 'info');
+
+        let parsed;
+        try {
+            const text = await this.readFileAsText(file);
+            parsed = JSON.parse(text);
+        } catch (error) {
+            console.error('[Supernotes Import] Parse error:', error);
+            this.showStatus(statusDiv, `Invalid JSON: ${error.message}`, 'error');
+            importBtn.disabled = false;
+            return;
+        }
+
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            this.showStatus(statusDiv, 'Invalid Supernotes export: top level must be a JSON object', 'error');
+            importBtn.disabled = false;
+            return;
+        }
+
+        try {
+            let collection;
+
+            if (isCreatingNew) {
+                const newName = newNameInput.value.trim();
+                this.showStatus(statusDiv, `Creating collection "${newName}"...`, 'info');
+                collection = await this.createSupernotesCollection(newName);
+                if (!collection) {
+                    throw new Error('Failed to create collection');
+                }
+            } else {
+                const collections = await this.data.getAllCollections();
+                collection = collections.find(c => c.getGuid() === collectionGuid);
+                if (!collection) {
+                    throw new Error('Collection not found');
+                }
+                this.showStatus(statusDiv, 'Checking collection fields...', 'info');
+                await this.ensureSupernotesFields(collection);
+                const refreshed = await this.data.getAllCollections();
+                collection = refreshed.find(c => c.getGuid() === collectionGuid) || collection;
+            }
+
+            await this.executeSupernotesImport(collection, parsed, statusDiv);
+
+            this.showStatus(statusDiv, 'Complete! Supernotes import finished.', 'success');
+            setTimeout(() => {
+                if (overlay.parentNode) {
+                    document.body.removeChild(overlay);
+                }
+            }, 2000);
+        } catch (error) {
+            console.error('[Supernotes Import] Error:', error);
+            this.showStatus(statusDiv, `Error: ${error.message}`, 'error');
+            importBtn.disabled = false;
+        }
+    }
+
     updateImportButtonState(importBtn, collectionSelect, selectedDirHandle) {
         const hasFolder = selectedDirHandle !== null;
         const hasCollection = collectionSelect.value !== '';
@@ -2404,6 +2624,206 @@ class Plugin extends AppPlugin {
 
         console.log('[MD Import] Collection created with', verifyConfig.fields.length, 'fields');
         return freshCollection;
+    }
+
+    async createSupernotesCollection(collectionName) {
+        console.log('[Supernotes Import] Creating collection:', collectionName);
+
+        const newCollection = await this.data.createCollection();
+        if (!newCollection) {
+            throw new Error('Failed to create collection');
+        }
+
+        const config = newCollection.getConfiguration();
+        const fields = [
+            {
+                id: 'supernotes_id',
+                label: 'Supernotes ID',
+                type: 'text',
+                icon: 'ti-fingerprint',
+                many: false,
+                read_only: true,
+                active: true
+            },
+            {
+                id: 'supernotes_tags',
+                label: 'Tags',
+                type: 'hashtag',
+                icon: 'ti-hash',
+                many: true,
+                read_only: false,
+                active: true
+            },
+            {
+                id: 'supernotes_created',
+                label: 'Supernotes created',
+                type: 'datetime',
+                icon: 'ti-clock',
+                many: false,
+                read_only: true,
+                active: true
+            },
+            {
+                id: 'supernotes_updated',
+                label: 'Supernotes modified',
+                type: 'datetime',
+                icon: 'ti-clock',
+                many: false,
+                read_only: true,
+                active: true
+            },
+            {
+                id: 'supernotes_daily_date',
+                label: 'Supernotes daily date',
+                type: 'text',
+                icon: 'ti-calendar',
+                many: false,
+                read_only: true,
+                active: true
+            },
+            {
+                id: 'supernotes_source',
+                label: 'Import source',
+                type: 'text',
+                icon: 'ti-download',
+                many: false,
+                read_only: true,
+                active: true
+            }
+        ];
+
+        config.name = collectionName;
+        config.icon = 'ti-notes';
+        config.item_name = 'Note';
+        config.description = 'Imported from Supernotes JSON';
+        config.fields = fields;
+        config.page_field_ids = fields.map(f => f.id);
+        config.sidebar_record_sort_field_id = 'supernotes_updated';
+        config.sidebar_record_sort_dir = 'desc';
+        config.show_sidebar_items = true;
+        config.show_cmdpal_items = true;
+
+        config.views = [
+            {
+                id: 'table',
+                label: 'All Notes',
+                description: 'Table view',
+                type: 'table',
+                icon: '',
+                shown: true,
+                read_only: false,
+                sort_field_id: fields[0]?.id || null,
+                sort_dir: 'asc',
+                group_by_field_id: null,
+                field_ids: fields.map(f => f.id),
+                opts: {}
+            }
+        ];
+
+        const success = await newCollection.saveConfiguration(config);
+        if (success === false) {
+            throw new Error('Failed to save collection configuration');
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        const allCollections = await this.data.getAllCollections();
+        const freshCollection = allCollections.find(c => c.getGuid() === newCollection.getGuid());
+
+        if (!freshCollection) {
+            throw new Error('Collection disappeared after creation');
+        }
+
+        const verifyConfig = freshCollection.getConfiguration();
+        if (!verifyConfig.fields || verifyConfig.fields.length === 0) {
+            throw new Error('Failed to create fields - configuration did not persist');
+        }
+
+        console.log('[Supernotes Import] Collection created with', verifyConfig.fields.length, 'fields');
+        return freshCollection;
+    }
+
+    async ensureSupernotesFields(collection) {
+        const config = collection.getConfiguration();
+        const fields = config.fields ? [...config.fields] : [];
+        const ids = new Set(fields.map(f => f.id));
+
+        const definitions = [
+            {
+                id: 'supernotes_id',
+                label: 'Supernotes ID',
+                type: 'text',
+                icon: 'ti-fingerprint',
+                many: false,
+                read_only: true,
+                active: true
+            },
+            {
+                id: 'supernotes_tags',
+                label: 'Tags',
+                type: 'hashtag',
+                icon: 'ti-hash',
+                many: true,
+                read_only: false,
+                active: true
+            },
+            {
+                id: 'supernotes_created',
+                label: 'Supernotes created',
+                type: 'datetime',
+                icon: 'ti-clock',
+                many: false,
+                read_only: true,
+                active: true
+            },
+            {
+                id: 'supernotes_updated',
+                label: 'Supernotes modified',
+                type: 'datetime',
+                icon: 'ti-clock',
+                many: false,
+                read_only: true,
+                active: true
+            },
+            {
+                id: 'supernotes_daily_date',
+                label: 'Supernotes daily date',
+                type: 'text',
+                icon: 'ti-calendar',
+                many: false,
+                read_only: true,
+                active: true
+            },
+            {
+                id: 'supernotes_source',
+                label: 'Import source',
+                type: 'text',
+                icon: 'ti-download',
+                many: false,
+                read_only: true,
+                active: true
+            }
+        ];
+
+        const additions = definitions.filter(d => !ids.has(d.id));
+        if (additions.length === 0) {
+            return;
+        }
+
+        config.fields = [...fields, ...additions];
+        const pageIds = [...(config.page_field_ids || [])];
+        for (const f of additions) {
+            if (!pageIds.includes(f.id)) {
+                pageIds.push(f.id);
+            }
+        }
+        config.page_field_ids = pageIds;
+
+        const success = await collection.saveConfiguration(config);
+        if (success === false) {
+            throw new Error('Failed to add Supernotes fields to collection');
+        }
+        await new Promise(resolve => setTimeout(resolve, 300));
     }
 
     getFieldIcon(fieldType) {
@@ -3012,6 +3432,255 @@ class Plugin extends AppPlugin {
         }
 
         return result;
+    }
+
+    async executeSupernotesImport(collection, exportObj, statusDiv = null) {
+        let imported = 0;
+        let updated = 0;
+        let errors = 0;
+
+        const entries = Object.entries(exportObj);
+        const total = entries.length;
+
+        const existingRecords = await collection.getAllRecords();
+        const existingBySupernotesId = new Map();
+        for (const record of existingRecords) {
+            const sid = typeof record.text === 'function' ? (record.text('supernotes_id') || '').trim() : '';
+            if (sid) {
+                existingBySupernotesId.set(sid.toLowerCase(), record);
+            }
+        }
+
+        if (statusDiv) {
+            this.showStatus(statusDiv, `Importing ${total} notes...`, 'info');
+        }
+
+        for (let i = 0; i < entries.length; i++) {
+            const [exportKey, entry] = entries[i];
+
+            if (i % 5 === 0) {
+                if (statusDiv) {
+                    this.showStatus(
+                        statusDiv,
+                        `Supernotes ${i + 1} / ${total} — imported ${imported}, updated ${updated}, errors ${errors}`,
+                        'info'
+                    );
+                }
+            }
+
+            try {
+                if (!entry || typeof entry !== 'object' || !entry.data || typeof entry.data !== 'object') {
+                    errors++;
+                    continue;
+                }
+                const data = entry.data;
+                const noteId = String(data.id || exportKey || '').trim();
+                if (!noteId) {
+                    errors++;
+                    continue;
+                }
+
+                const title = (data.name && String(data.name).trim()) ? String(data.name).trim() : 'Untitled';
+                const markup = typeof data.markup === 'string' ? data.markup : '';
+                const html = typeof data.html === 'string' ? data.html : '';
+
+                const idKey = noteId.toLowerCase();
+                let record = existingBySupernotesId.get(idKey);
+
+                if (record) {
+                    await new Promise(resolve => setTimeout(resolve, 150));
+                    this.applySupernotesMetadata(record, data);
+                    await this.insertSupernotesBody(record, markup, html, data.link_cache);
+                    updated++;
+                } else {
+                    const recordGuid = collection.createRecord(title);
+                    if (!recordGuid) {
+                        throw new Error('Failed to create record');
+                    }
+
+                    record = null;
+                    for (let attempt = 0; attempt < 5; attempt++) {
+                        await new Promise(resolve => setTimeout(resolve, 100 + attempt * 50));
+                        const records = await collection.getAllRecords();
+                        record = records.find(r => r.guid === recordGuid);
+                        if (record) break;
+                    }
+                    if (!record) {
+                        console.error(`[Supernotes Import] Record not found after create: ${title}`);
+                        errors++;
+                        continue;
+                    }
+
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    this.applySupernotesMetadata(record, data);
+                    await this.insertSupernotesBody(record, markup, html, data.link_cache);
+
+                    existingBySupernotesId.set(idKey, record);
+                    imported++;
+                }
+            } catch (err) {
+                console.error(`[Supernotes Import] Note ${exportKey}:`, err);
+                errors++;
+            }
+        }
+
+        if (statusDiv) {
+            this.showStatus(statusDiv, 'Resolving wiki-style links...', 'info');
+        } else {
+            this.showToast('Resolving wiki-style links...', 2000);
+        }
+        await this.resolveWikiLinksWithSegments(collection, 'obsidian', statusDiv);
+
+        if (statusDiv) {
+            this.showStatus(
+                statusDiv,
+                `Done: imported ${imported}, updated ${updated}, errors ${errors}`,
+                'success'
+            );
+        } else {
+            this.showToast(`Supernotes: imported ${imported}, updated ${updated}, errors ${errors}`, 8000);
+        }
+
+        return { imported, updated, errors };
+    }
+
+    applySupernotesMetadata(record, data) {
+        const idVal = data.id != null ? String(data.id) : '';
+        if (idVal) {
+            this.setFieldValue(record, 'supernotes_id', idVal);
+        }
+
+        if (Array.isArray(data.tags) && data.tags.length > 0) {
+            this.setFieldValue(record, 'supernotes_tags', data.tags);
+        } else {
+            try {
+                const p = record.prop('supernotes_tags');
+                if (p && typeof p.set === 'function') {
+                    p.set([]);
+                }
+            } catch (e) {
+                /* ignore */
+            }
+        }
+
+        if (data.created_when) {
+            this.setFieldValue(record, 'supernotes_created', data.created_when);
+        }
+        if (data.modified_when) {
+            this.setFieldValue(record, 'supernotes_updated', data.modified_when);
+        }
+        if (data.daily_date != null && data.daily_date !== '') {
+            this.setFieldValue(record, 'supernotes_daily_date', String(data.daily_date));
+        }
+        this.setFieldValue(record, 'supernotes_source', 'supernotes');
+    }
+
+    /**
+     * Supernotes markup may contain preview references: (^uuid). data.link_cache maps that uuid to a
+     * display label. Resolve to a markdown link targeting the web preview URL
+     * (https://my.supernotes.app/entry/web?preview=<uuid>).
+     */
+    resolveSupernotesLinkCacheInText(text, linkCache) {
+        if (!text || typeof text !== 'string') {
+            return text;
+        }
+        if (!linkCache || typeof linkCache !== 'object' || Array.isArray(linkCache)) {
+            return text;
+        }
+
+        const previewBase = 'https://my.supernotes.app/entry/web?preview=';
+        const re = /\(\^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\)/gi;
+
+        const lookupLabel = (guid) => {
+            const want = guid.toLowerCase();
+            for (const [k, v] of Object.entries(linkCache)) {
+                if (k && String(k).toLowerCase() === want) {
+                    if (typeof v === 'string' && v.trim()) {
+                        return v.trim();
+                    }
+                    if (v != null && typeof v !== 'object') {
+                        return String(v).trim() || null;
+                    }
+                }
+            }
+            return null;
+        };
+
+        const escapeMdLinkLabel = (s) => String(s)
+            .replace(/\\/g, '\\\\')
+            .replace(/\[/g, '\\[')
+            .replace(/\]/g, '\\]');
+
+        return text.replace(re, (match, guid) => {
+            const label = lookupLabel(guid) || guid;
+            const url = previewBase + encodeURIComponent(guid);
+            return `[${escapeMdLinkLabel(label)}](${url})`;
+        });
+    }
+
+    async insertSupernotesBody(record, markup, html, linkCache = null) {
+        const md = (markup || '').trim();
+        if (md) {
+            const mdResolved = this.resolveSupernotesLinkCacheInText(md, linkCache);
+            const prepared = this.prepareMarkdownForThymerImport(mdResolved);
+            const textProp = record.prop('text');
+            if (textProp) {
+                textProp.set('');
+            }
+            await new Promise(resolve => setTimeout(resolve, 50));
+            await record.insertFromMarkdown(prepared, null, null);
+            return;
+        }
+
+        const h = this.resolveSupernotesLinkCacheInText((html || '').trim(), linkCache);
+        const textProp = record.prop('text');
+        if (textProp) {
+            textProp.set('');
+        }
+        await new Promise(resolve => setTimeout(resolve, 50));
+        if (!h) {
+            return;
+        }
+
+        if (typeof record.insertFromHtml === 'function') {
+            try {
+                const ok = await record.insertFromHtml(h, null, null);
+                if (ok !== false) {
+                    return;
+                }
+            } catch (e) {
+                console.warn('[Supernotes Import] insertFromHtml failed, falling back to plain text', e);
+            }
+        }
+        if (typeof record.insertFromHTML === 'function') {
+            try {
+                const ok = await record.insertFromHTML(h, null, null);
+                if (ok !== false) {
+                    return;
+                }
+            } catch (e) {
+                console.warn('[Supernotes Import] insertFromHTML failed, falling back to plain text', e);
+            }
+        }
+
+        const plain = this.htmlToPlainTextFromSupernotes(h);
+        const prepared = this.prepareMarkdownForThymerImport(plain);
+        await record.insertFromMarkdown(prepared, null, null);
+    }
+
+    htmlToPlainTextFromSupernotes(html) {
+        if (!html || typeof html !== 'string') {
+            return '';
+        }
+        const s = html
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<\/p>/gi, '\n\n')
+            .replace(/<\/div>/gi, '\n')
+            .replace(/<\/li>/gi, '\n');
+        const div = document.createElement('div');
+        div.innerHTML = s;
+        const text = (div.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+        return text;
     }
 
     // =========================================================================
