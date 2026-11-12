@@ -18,8 +18,9 @@ export class AppPluginStub {
 }
 
 // `globals` are extra free identifiers plugin.js expects from Thymer (e.g. DateTime).
+// PLUGIN_JS=/path/to/older/plugin.js runs the suite against another copy of the plugin (to check that a regression test fails without its fix).
 export function loadPlugin(globals = {}) {
-    const src = readFileSync(path.join(root, 'plugin.js'), 'utf8');
+    const src = readFileSync(process.env.PLUGIN_JS || path.join(root, 'plugin.js'), 'utf8');
     const names = Object.keys(globals);
     const factory = new Function('AppPlugin', ...names, `${src}\n;return { Plugin, VERSION, LinkIndex };`);
     return factory(AppPluginStub, ...names.map(n => globals[n]));

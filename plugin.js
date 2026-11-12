@@ -5,6 +5,7 @@ const VERSION = 'v0.0.13';
  * 
  * v0.0.13 - New sources Tolaria (vault with typed notes) and Notion export (Markdown & CSV, one collection per database) on a shared ImportPlan engine (record references, link index, images, date-only values via DateTime.dateOnly); they use an <input webkitdirectory> folder picker (works in Thymer Desktop); a same-named existing collection that is not a previous import asks first: separate (prefixed) collections or merge; Node test harness (npm test)
  * v0.0.13 (review fixes) - Notion: rows folder named with the database id is claimed, page-less rows with the same title keep distinct source paths (#2, #3); Tolaria: collision-free field ids (cost, cost_2); re-import matches by source_path alone (a changed title renames the record via its Title property, no duplicate), persisted choice fields gain new options whatever the inference says, and values removed from the source are cleared on update (counted in the report)
+ * v0.0.13 (review fixes, round 2) - on re-import the persisted collection is authoritative: fields are matched to existing ones by label (Tolaria / Notion field ids no longer shift when a colliding key appears later), every value is written according to the persisted field's type, many-ness and options (dates via DateTime.dateOnly / dateAndTime, links as source text in url / text fields, multi-choice tokens), a Notion page renamed in the export is matched by its page id, and existing: 'skip' also skips the link and asset passes
  * v0.0.12 - Create New Collection: frontmatter keys tag / tags get property type hashtag (many: true when values are YAML lists)
  * v0.0.11 - Markdown folder picker: use pickFolder() like journal import (showDirectoryPicker without startIn + webkitdirectory fallback for Safari/macOS); scanVaultFiles supports file-list result
  * v0.0.10 - Optional plugin.json custom.markdown_import_hashtag_escape (default true): set false to disable v0.0.9 hashtag-like token escaping
@@ -4405,6 +4406,7 @@ class Plugin extends AppPlugin {
         add('div', `Collections: ${c.collectionsCreated} created, ${c.collectionsUpdated} updated`);
         add('div', `Records: ${c.recordsCreated} created, ${c.recordsUpdated} updated${c.recordsRenamed ? ` (${c.recordsRenamed} renamed)` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`);
         if (c.valuesCleared) add('div', `Values cleared (gone from the source): ${c.valuesCleared}`);
+        if (c.fieldsRemapped) add('div', `Fields matched to existing ones by label: ${c.fieldsRemapped}`);
         add('div', `Links: ${c.linksResolved} resolved, ${c.linksUnresolved} unresolved`);
         add('div', `Images: ${c.assetsUploaded} uploaded${c.assetsFailed ? `, ${c.assetsFailed} failed` : ''}`);
         if (p.unusedTypes && p.unusedTypes.length) add('div', `Types with no notes (no collection created): ${p.unusedTypes.join(', ')}`, 'margin-top: 8px; font-size: 12px;');
@@ -4727,7 +4729,7 @@ class Plugin extends AppPlugin {
         let rest = String(cell).replace(re, (all, label, url) => {
             const id = this._notionIsNotionUrl(url) ? this._notionIdFromUrl(url) : null;
             if (!id) return all;
-            ids.push({ id, url, label: (label || '').trim() || undefined });
+            ids.push({ id, url, raw: all.trim(), label: (label || '').trim() || undefined });
             return '\u0000';
         });
         const text = rest.split(/\u0000|,\s+|,$/).map(t => t.trim()).filter(Boolean);
@@ -5076,7 +5078,7 @@ class Plugin extends AppPlugin {
                         const matchedIds = [];
                         for (const x of ids) {
                             if (ctx.idIndex.has(x.id)) {
-                                this.planPropertyLink(plan, rec.key, col.id, { ref: x.id, kind: 'notion_id' }, { label: x.label, raw: x.url });
+                                this.planPropertyLink(plan, rec.key, col.id, { ref: x.id, kind: 'notion_id' }, { label: x.label, raw: x.raw });
                                 matchedIds.push(x.id);
                             } else {
                                 leftover.push(x.url);
@@ -5184,6 +5186,7 @@ class Plugin extends AppPlugin {
             `Collections: ${c.collectionsCreated || 0} created, ${c.collectionsUpdated || 0} updated`,
             `Records: ${c.recordsCreated || 0} created, ${c.recordsUpdated || 0} updated${c.recordsRenamed ? ` (${c.recordsRenamed} renamed)` : ''}${c.recordsSkipped ? `, ${c.recordsSkipped} skipped` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`,
             ...(c.valuesCleared ? [`Values cleared (gone from the source): ${c.valuesCleared}`] : []),
+            ...(c.fieldsRemapped ? [`Fields matched to existing ones by label: ${c.fieldsRemapped}`] : []),
             `Links: ${c.linksResolved || 0} resolved, ${c.linksUnresolved || 0} unresolved`,
             `Images/files: ${c.assetsUploaded || 0} uploaded${c.assetsFailed ? `, ${c.assetsFailed} failed` : ''}`
         ];
@@ -5326,12 +5329,19 @@ class Plugin extends AppPlugin {
             const fields = (api.getConfiguration() || {}).fields || [];
             if (!fields.some(f => f && f.id === 'source_path')) return 'no-source-path-field';
             const planned = new Set();
+            const plannedIds = new Set();   // Notion page ids: a page renamed since the last import has a new path but the same id
             for (const rec of plan.records || []) {
-                if (rec.collection === def.key && rec.sourcePath) planned.add(String(rec.sourcePath).trim().toLowerCase());
+                if (rec.collection !== def.key) continue;
+                if (rec.sourcePath) planned.add(String(rec.sourcePath).trim().toLowerCase());
+                const id = this._planNotionIdOf(rec);
+                if (id) plannedIds.add(id);
             }
             for (const record of await api.getAllRecords()) {
                 const path = typeof record.text === 'function' ? record.text('source_path') : null;
-                if (path && planned.has(String(path).trim().toLowerCase())) return null;
+                if (!path) continue;
+                if (planned.has(String(path).trim().toLowerCase())) return null;
+                const id = LinkIndex.extractNotionId(String(path).trim().split('/').pop());
+                if (id && plannedIds.has(id)) return null;
             }
             return 'no-matching-records';
         } catch (error) {
@@ -5607,9 +5617,10 @@ class Plugin extends AppPlugin {
                 linksResolved: 0, linksUnresolved: 0,
                 assetsUploaded: 0, assetsFailed: 0,
                 journalCreated: 0, journalSkipped: 0,
-                valuesCleared: 0, recordsRenamed: 0
+                valuesCleared: 0, recordsRenamed: 0, fieldsRemapped: 0
             },
             unresolvedLinks: [],
+            remappedFields: [],   // [{ collection, label, from, to, reason }]: plan field ids changed to fit the persisted collection
             errors: [],
             warnings: this.validateImportPlan(plan)
         };
@@ -5682,6 +5693,18 @@ class Plugin extends AppPlugin {
             }
         }
 
+        // 1a': an existing collection's persisted fields decide which field id each plan field writes to
+        for (const entry of ctx.collections.values()) {
+            if (entry.failed || entry.created) continue;
+            try {
+                this._planReconcileFieldIds(ctx, entry);
+            } catch (error) {
+                // writing with ids that were not reconciled could land values in the wrong field: leave this collection out
+                entry.failed = true;
+                this._planError(ctx, 1, error, { collection: entry.def.key });
+            }
+        }
+
         // 1b: write names / icons / descriptions / fields
         let done = 0;
         for (const entry of ctx.collections.values()) {
@@ -5716,8 +5739,115 @@ class Plugin extends AppPlugin {
                 ctx.report.warnings.push({ code: 'fields-not-persisted', message: `fields missing after save: ${missing.join(', ')}`, collection: entry.def.key });
             }
             entry.api = api;
+            entry.schema = this._planSchemaOf(api.getConfiguration().fields);   // what every value write is coerced to
             ctx.report.counts[entry.created ? 'collectionsCreated' : 'collectionsUpdated']++;
         }
+    }
+
+    /**
+     * The persisted definition of every field of a collection: { id, label, type, many, choices: [{ id, label }] }
+     * (types.d.ts:4085 PropertyField; inactive choices left out). Built from the configuration read back after
+     * pass 1 has saved, so it includes the fields and options this run just added. A re-import never trusts the
+     * plan's own idea of a field's type: the field was created by an earlier import (or by hand) and keeps its type.
+     */
+    _planSchemaOf(fields) {
+        const schema = new Map();
+        for (const f of fields || []) {
+            if (!f || !f.id) continue;
+            schema.set(f.id, {
+                id: f.id, label: f.label, type: f.type || 'text', many: f.many === true,
+                choices: (f.choices || []).filter(c => c && c.active !== false).map(c => ({ id: c.id, label: String(c.label) }))
+            });
+        }
+        return schema;
+    }
+
+    /**
+     * Matches the plan's fields for an EXISTING collection to its persisted fields, and gives every plan field the id
+     * of the persisted field it stands for. The label is the identity (an id is only a slug of it, and slugs are lossy
+     * and depend on what else is in the export: "cost ($)" / "cost (%)" are both "cost", so which of them gets `cost`
+     * and which `cost_2` shifts when a colliding column first shows up in a later export):
+     *   1. a persisted field with the same id and the same label (compared case-insensitively, ignoring runs of
+     *      space / _ / -) is that field;
+     *   2. otherwise a still unmatched persisted field with the same label;
+     *   3. a plan field with no persisted counterpart is new: it keeps its id when nothing in the collection uses it,
+     *      else it gets name_2, name_3, ... avoiding every id the collection already has and every id the plan uses.
+     * source_path is never a candidate. Persisted fields are never retyped or removed here. The plan is not mutated:
+     * ctx.plan becomes a copy whose field ids, record values and property links of this collection are rewritten.
+     * (A field whose label was edited in Thymer is therefore a new field on the next import, not a silent overwrite.)
+     */
+    _planReconcileFieldIds(ctx, entry) {
+        const def = entry.def;
+        const planFields = (def.fields || []).map(fd => { const id = fd.id || this.slugify(fd.label); return { id, label: fd.label || id }; });
+        if (planFields.length === 0) return;
+        const persisted = ((entry.api.getConfiguration() || {}).fields || []).filter(f => f && f.id);
+        const norm = (text) => String(text == null ? '' : text).normalize('NFC').trim().toLowerCase().replace(/[\s_-]+/g, ' ');
+        const candidates = persisted.filter(f => f.id !== 'source_path');
+        const claimed = new Set();
+        const finalIds = new Array(planFields.length).fill(null);
+        const reasons = new Array(planFields.length).fill('');
+        planFields.forEach((pf, i) => {
+            const have = candidates.find(f => f.id === pf.id && !claimed.has(f.id) && norm(f.label) === norm(pf.label));
+            if (have) { claimed.add(have.id); finalIds[i] = have.id; }
+        });
+        planFields.forEach((pf, i) => {
+            if (finalIds[i]) return;
+            const have = candidates.find(f => !claimed.has(f.id) && norm(f.label) === norm(pf.label));
+            if (have) { claimed.add(have.id); finalIds[i] = have.id; reasons[i] = 'matched-by-label'; }
+        });
+        const taken = new Set([...persisted.map(f => f.id), 'source_path', ...finalIds.filter(Boolean)]);
+        planFields.forEach((pf, i) => {
+            if (finalIds[i] || taken.has(pf.id)) return;
+            taken.add(pf.id);
+            finalIds[i] = pf.id;
+        });
+        planFields.forEach((pf, i) => {
+            if (finalIds[i]) return;
+            let n = 2;
+            while (taken.has(`${pf.id}_${n}`)) n++;
+            finalIds[i] = `${pf.id}_${n}`;
+            taken.add(finalIds[i]);
+            reasons[i] = 'id-taken';
+        });
+
+        const idMap = new Map();
+        planFields.forEach((pf, i) => {
+            if (finalIds[i] === pf.id) return;
+            idMap.set(pf.id, finalIds[i]);
+            ctx.report.remappedFields.push({ collection: def.key, label: pf.label, from: pf.id, to: finalIds[i], reason: reasons[i] });
+            ctx.report.counts.fieldsRemapped++;
+        });
+        if (idMap.size) this._planRemapFields(ctx, entry, idMap);
+    }
+
+    /** Rewrites field ids (old id -> new id, all at once) in one collection's definition, its records' values and its property links. */
+    _planRemapFields(ctx, entry, idMap) {
+        if (!ctx.planCopied) {
+            ctx.plan = { ...ctx.plan, collections: ctx.plan.collections.slice(), records: ctx.plan.records.slice(), links: (ctx.plan.links || []).slice() };
+            ctx.planCopied = true;
+        }
+        const plan = ctx.plan;
+        const key = entry.def.key;
+        const def = { ...entry.def, fields: (entry.def.fields || []).map(fd => {
+            const id = fd.id || this.slugify(fd.label);
+            return idMap.has(id) ? { ...fd, id: idMap.get(id) } : fd;
+        }) };
+        const at = plan.collections.indexOf(entry.def);
+        if (at < 0) throw new Error(`collection ${key} is not in the plan`);
+        plan.collections[at] = def;
+        entry.def = def;
+        const recordKeys = new Set();
+        plan.records.forEach((rec, i) => {
+            if (rec.collection !== key) return;
+            recordKeys.add(rec.key);
+            if (!rec.values || !Object.keys(rec.values).some(k => idMap.has(k))) return;
+            const values = {};
+            for (const [k, v] of Object.entries(rec.values)) values[idMap.has(k) ? idMap.get(k) : k] = v;
+            plan.records[i] = { ...rec, values };
+        });
+        plan.links.forEach((link, i) => {
+            if (link.where === 'property' && recordKeys.has(link.from) && idMap.has(link.field)) plan.links[i] = { ...link, field: idMap.get(link.field) };
+        });
     }
 
     _planFieldType(fd) { return fd.type || 'text'; }
@@ -5727,8 +5857,13 @@ class Plugin extends AppPlugin {
         return this._planFieldType(fd) === 'record' ? 'ti-arrow-right' : this.getFieldIcon(this._planFieldType(fd));
     }
 
-    /** Distinct string values a plan stores in a choice field, in first-seen order. */
-    _planChoiceLabels(ctx, def, fieldId, declared) {
+    /**
+     * Distinct option labels a plan needs in a choice field, in first-seen order: the declared choices, then the
+     * values of every record of the collection, and (when the persisted field is a choice but the plan's is a record
+     * field) the source text of its property links. `many` is the PERSISTED field's many-ness, because that is what the
+     * values will be written as: see _planChoiceTokens().
+     */
+    _planChoiceLabels(ctx, def, fieldId, declared, many = false) {
         const labels = [];
         const seen = new Set();
         const add = (v) => {
@@ -5737,12 +5872,71 @@ class Plugin extends AppPlugin {
             if (!seen.has(label.toLowerCase())) { seen.add(label.toLowerCase()); labels.push(label); }
         };
         for (const c of declared || []) add(typeof c === 'string' ? c : c.label);
+        const links = this._planPropertyLinks(ctx);
         for (const rec of ctx.plan.records) {
-            if (rec.collection !== def.key || !rec.values || rec.values[fieldId] === undefined) continue;
-            const t = this.transformValue(rec.values[fieldId]);
-            for (const v of (Array.isArray(t) ? t : [t])) add(v);
+            if (rec.collection !== def.key) continue;
+            const items = [];
+            if (rec.values && rec.values[fieldId] !== undefined) items.push(rec.values[fieldId]);
+            for (const link of (links.get(rec.key) || new Map()).get(fieldId) || []) items.push(this._planLinkRaw(link));
+            for (const token of this._planChoiceTokens(items, many)) add(token);
         }
         return labels;
+    }
+
+    /** Property links of the plan: record key -> Map(field id -> [link]). Built after pass 1 has rewritten any field ids. */
+    _planPropertyLinks(ctx) {
+        if (!ctx.propertyLinks) {
+            const byRecord = new Map();
+            for (const link of ctx.plan.links || []) {
+                if (link.where !== 'property') continue;
+                if (!byRecord.has(link.from)) byRecord.set(link.from, new Map());
+                const byField = byRecord.get(link.from);
+                if (!byField.has(link.field)) byField.set(link.field, []);
+                byField.get(link.field).push(link);
+            }
+            ctx.propertyLinks = byRecord;
+        }
+        return ctx.propertyLinks;
+    }
+
+    /** The text a property link stands for in the source (never a Thymer GUID): raw, else its label, else its target. */
+    _planLinkRaw(link) {
+        return link.raw !== undefined ? link.raw : (link.label !== undefined ? link.label : link.target.ref);
+    }
+
+    _planPresent(v) {
+        return v !== null && v !== undefined && !(typeof v === 'string' && v.trim() === '');
+    }
+
+    /** One level of arrays flattened, empty values dropped. */
+    _planFlatPresent(items) {
+        return items.flatMap(i => (Array.isArray(i) ? i : [i])).filter(v => this._planPresent(v));
+    }
+
+    /**
+     * The option labels a value stands for in a choice field, by the field's many-ness:
+     *   many    an array's elements are the tokens as given; a text value is split the way the Notion multi-select parser
+     *           splits a cell (_notionSelectTokens: on a comma followed by whitespace, trimmed). Case-insensitive duplicates go.
+     *   single  the whole value is ONE token (an array is joined with ", ").
+     * items: scalars and arrays, as found in plan values and as the source text of links.
+     */
+    _planChoiceTokens(items, many) {
+        const out = [];
+        const seen = new Set();
+        const add = (text) => {
+            const t = String(text).trim();
+            if (t && !seen.has(t.toLowerCase())) { seen.add(t.toLowerCase()); out.push(t); }
+        };
+        if (many) {
+            for (const item of items) {
+                if (Array.isArray(item)) item.filter(v => this._planPresent(v)).forEach(add);
+                else if (this._planPresent(item)) this._notionSelectTokens(String(item)).forEach(add);
+            }
+        } else {
+            const parts = this._planFlatPresent(items).map(v => String(v).trim());
+            if (parts.length) add(parts.join(', '));
+        }
+        return out;
     }
 
     _planChoiceOptions(labels, declared, startIndex = 0, usedIds = new Set()) {
@@ -5767,7 +5961,7 @@ class Plugin extends AppPlugin {
             const id = fd.id || this.slugify(fd.label);
             const field = { id, label: fd.label || id, type, icon: this._planFieldIcon(fd), many: fd.many === true, read_only: false, active: true };
             if (type === 'choice') {
-                const labels = this._planChoiceLabels(ctx, def, id, fd.choices);
+                const labels = this._planChoiceLabels(ctx, def, id, fd.choices, fd.many === true);
                 field.choices = this._planChoiceOptions(labels, fd.choices);
             }
             if (type === 'record' && fd.target) {
@@ -5815,8 +6009,10 @@ class Plugin extends AppPlugin {
             if (have.type === 'choice') {
                 // Decided by the persisted field, not by this run's inference: a column that was a choice on the first
                 // import can come back as text (e.g. more distinct values), and its values must still find an option.
-                // The field is never retyped; only missing options are added.
-                const labels = w.type === 'choice' ? w.choices.map(c => c.label) : this._planChoiceLabels(ctx, def, w.id, []);
+                // The field is never retyped; only missing options are added. The options come from the values as the
+                // PERSISTED field will store them (a multi-value field's text cell is split into tokens, never added whole).
+                const fd = (def.fields || []).find(f => (f.id || this.slugify(f.label)) === w.id);
+                const labels = this._planChoiceLabels(ctx, def, w.id, fd && fd.choices, have.many === true);
                 have.choices = have.choices || [];
                 const known = new Set(have.choices.map(c => String(c.label).toLowerCase()));
                 const used = new Set(have.choices.map(c => c.id));
@@ -5847,21 +6043,45 @@ class Plugin extends AppPlugin {
 
     /**
      * Existing records of a collection, indexed for re-import:
-     *   byPath  source_path (trimmed, lowercased, as makeDedupKey() normalises it) -> record, for every record that has one;
-     *   byTitle title (trimmed, lowercased) -> record, only for records that have NO source_path (hand-made or older imports).
-     * A record that has a source_path is identified by it alone, so a changed title cannot create a duplicate.
+     *   byPath      source_path (trimmed, lowercased, as makeDedupKey() normalises it) -> record, for every record that has one;
+     *   byNotionId  the 32-hex Notion page id in the file name of a source_path ("Title <id>.md") -> record. A page renamed
+     *               in Notion changes its path but not its id, so the id identifies it across renames;
+     *   byTitle     title (trimmed, lowercased) -> record, only for records that have NO source_path (hand-made or older imports).
+     * A record that has a source_path is identified by it (or its Notion id) alone, so a changed title cannot create a
+     * duplicate. pathOf / idOf are the reverse maps, kept current as records are matched.
      * executeImport() (CSV / Obsidian / ...) keeps its own source_path||title key; only the engine uses this.
      */
     async _planExistingRecords(collection) {
         const norm = (text) => String(text || '').trim().toLowerCase();
         const byPath = new Map();
         const byTitle = new Map();
+        const byNotionId = new Map();
+        const pathOf = new Map();
+        const idOf = new Map();
         for (const record of await collection.getAllRecords()) {
             const pathValue = norm(typeof record.text === 'function' ? (record.text('source_path') || record.text('path') || '') : '');
-            if (pathValue) byPath.set(pathValue, record);
-            else if (norm(record.getName())) byTitle.set(norm(record.getName()), record);
+            if (pathValue) {
+                byPath.set(pathValue, record);
+                pathOf.set(record, pathValue);
+                const id = LinkIndex.extractNotionId(pathValue.split('/').pop());
+                if (id) { idOf.set(record, id); if (!byNotionId.has(id)) byNotionId.set(id, record); }
+            } else if (norm(record.getName())) {
+                byTitle.set(norm(record.getName()), record);
+            }
         }
-        return { byPath, byTitle, norm };
+        return { byPath, byTitle, byNotionId, pathOf, idOf, norm };
+    }
+
+    /** The Notion page id a plan record stands for: its notion_id alias, else a "notion:<32 hex>" key; null for records without one. */
+    _planNotionIdOf(def) {
+        for (const alias of (def && def.aliases) || []) {
+            if (alias && alias.kind === 'notion_id') {
+                const id = LinkIndex.extractNotionId(alias.value);
+                if (id) return id;
+            }
+        }
+        const m = String((def && def.key) || '').match(/^notion:([0-9a-f]{32})$/i);
+        return m ? m[1].toLowerCase() : null;
     }
 
     /** Deletes a record's body (children first). Never follows references into other records. */
@@ -5898,7 +6118,14 @@ class Plugin extends AppPlugin {
                 const existing = existingByCollection.get(def.collection);
                 const pathKey = existing.norm(def.sourcePath);
                 const titleKey = existing.norm(def.title);
-                let found = pathKey ? existing.byPath.get(pathKey) : existing.byTitle.get(titleKey);
+                // A Notion page is first looked up by its page id (its path changes when the page is renamed). A path match
+                // is not taken when that record belongs to a different page.
+                const notionId = this._planNotionIdOf(def);
+                let found = notionId ? existing.byNotionId.get(notionId) : undefined;
+                if (!found) {
+                    found = pathKey ? existing.byPath.get(pathKey) : existing.byTitle.get(titleKey);
+                    if (found && notionId && existing.idOf.get(found) && existing.idOf.get(found) !== notionId) found = undefined;
+                }
                 if (!found && pathKey) {
                     // Adopt a record that has the same title but no source_path yet, once only
                     // (a record that has a source_path is never taken by title).
@@ -5926,29 +6153,15 @@ class Plugin extends AppPlugin {
                     await this._planSleep(ctx, ctx.opts.settleMs ?? 300);
                 }
                 ctx.index.bind(def.key, record.guid);
-                if (pathKey) existing.byPath.set(pathKey, record);
+                // the record now answers to this run's path (it may have been renamed in the source) and page id
+                const oldPath = existing.pathOf.get(record);
+                if (oldPath && oldPath !== pathKey && existing.byPath.get(oldPath) === record) existing.byPath.delete(oldPath);
+                if (pathKey) { existing.byPath.set(pathKey, record); existing.pathOf.set(record, pathKey); }
                 else existing.byTitle.set(titleKey, record);
+                if (notionId) { existing.byNotionId.set(notionId, record); existing.idOf.set(record, notionId); }
                 ctx.records.set(def.key, { def, record });
-                if (this.setFieldValue(record, 'source_path', def.sourcePath) === false && def.sourcePath) {
-                    ctx.report.warnings.push({ code: 'property-not-set', message: 'source_path not set', record: def.key, field: 'source_path' });
-                }
-                const dateFields = this._planDateFieldIds(ctx.plan, def.collection);
-                for (const [fieldId, value] of Object.entries(def.values || {})) {
-                    if (value === null || value === undefined || value === '') continue;
-                    if (Array.isArray(value) && value.length === 0) continue;
-                    if (dateFields.has(fieldId)) {
-                        const done = this._planSetDateValue(record, fieldId, value);
-                        if (done === true) continue;
-                        if (done === false) {
-                            ctx.report.warnings.push({ code: 'property-not-set', message: `${fieldId} not set`, record: def.key, field: fieldId });
-                            continue;
-                        }
-                        // null: not a date this engine can parse; fall through to the generic setter
-                    }
-                    if (!this.setFieldValue(record, fieldId, this.transformValue(value))) {
-                        ctx.report.warnings.push({ code: 'property-not-set', message: `${fieldId} not set`, record: def.key, field: fieldId });
-                    }
-                }
+                this._planWriteSourcePath(ctx, def, record);
+                this._planWriteValues(ctx, col, def, record);
 
                 if (before) {
                     this._planRenameIfChanged(ctx, def, record, before);
@@ -6004,13 +6217,11 @@ class Plugin extends AppPlugin {
      * Thymer reads are stale right after a write, so nothing here is ever re-read after the writes that follow.
      */
     _planReadUpdateState(ctx, entry, def, record) {
-        if (!ctx.propertyLinkKeys) {
-            ctx.propertyLinkKeys = new Set((ctx.plan.links || []).filter(l => l.where === 'property').map(l => `${l.from}\u0000${l.field}`));
-        }
+        const links = this._planPropertyLinks(ctx).get(def.key) || new Map();
         const present = (v) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.filter(x => x !== null && x !== undefined && x !== '').length === 0);
         const toClear = [];
         for (const fieldId of this._planClearableFields(ctx, entry)) {
-            if (present((def.values || {})[fieldId]) || ctx.propertyLinkKeys.has(`${def.key}\u0000${fieldId}`)) continue;
+            if (present((def.values || {})[fieldId]) || links.has(fieldId)) continue;
             try {
                 const prop = record.prop(fieldId);
                 const stored = prop && (typeof prop.count === 'function' ? prop.count() : (typeof prop.values === 'function' ? prop.values().length : 0));
@@ -6084,12 +6295,6 @@ class Plugin extends AppPlugin {
 
     // ---- dates --------------------------------------------------------------
 
-    /** Ids of the plan fields of type 'datetime' in one collection. */
-    _planDateFieldIds(plan, collectionKey) {
-        const col = (plan.collections || []).find(c => c.key === collectionKey);
-        return new Set(((col && col.fields) || []).filter(f => f.type === 'datetime').map(f => f.id));
-    }
-
     /**
      * 'YYYY-MM-DD' | 'YYYY-MM-DDTHH:MM[:SS]' (a space may replace the T) -> { y, m0, d, h?, mi?, s? } (m0 is 0-based),
      * or null when it is not one of those forms or not a real calendar date/time.
@@ -6134,20 +6339,142 @@ class Plugin extends AppPlugin {
         return dt.value();
     }
 
-    /** true: set; false: the property is missing or rejected the value; null: not a plan date, caller falls back. */
-    _planSetDateValue(record, fieldId, value) {
+    /**
+     * Any date text a source can hand over, as a DateTimeValue, or null:
+     *   the plan's own forms ('YYYY-MM-DD', 'YYYY-MM-DDTHH:MM[:SS]', 'A/B'): see _planDateValue();
+     *   an ISO instant with a zone ('2026-03-01T10:00:00Z', '...+01:00'): its local wall-clock time, as a Date shows it
+     *     (types.d.ts:484-492: Thymer stores date and time in the local timezone);
+     *   what the Notion parser reads ('March 1, 2026', '1 March 2026 3:30 PM', '2026/3/1', 'A → B'), but only when all of
+     *     it is understood (a range whose end is not, is not turned into its start).
+     * Never goes through prop.setFromDate(): a Date made from 'YYYY-MM-DD' is UTC midnight, the evening before in any
+     * timezone west of UTC.
+     */
+    _planDateOf(value) {
+        if (typeof value !== 'string' || typeof DateTime === 'undefined') return null;
+        const text = value.trim();
+        const plain = this._planDateValue(text);
+        if (plain) return plain;
+        const iso = text.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)(?:\.\d+)?(Z|[+-]\d{2}:?\d{2})$/i);
+        if (iso) {
+            const zone = /^[+-]\d{4}$/.test(iso[3]) ? `${iso[3].slice(0, 3)}:${iso[3].slice(3)}` : iso[3].toUpperCase();
+            const when = new Date(`${iso[1]}T${iso[2]}${zone}`);
+            if (isNaN(when.getTime())) return null;
+            return DateTime.dateAndTime(when.getFullYear(), when.getMonth(), when.getDate(), when.getHours(), when.getMinutes(), when.getSeconds()).value();
+        }
+        const cell = this._notionDateCell(text);
+        return cell && (!cell.range || cell.kept) ? this._planDateValue(cell.value) : null;
+    }
+
+    // ---- writing values, by the PERSISTED field -----------------------------------
+    //
+    // Which type a field has is decided by the collection in the workspace (entry.schema), never by this run's plan:
+    // an earlier import (or the user) created the field, an export can change what a column looks like from one
+    // run to the next (date -> text, relation -> url, multi-choice -> text, ...), and a field is never retyped. Every value is
+    // coerced to the persisted type, many-ness and options, and what cannot be coerced is a 'property-not-set' warning
+    // that leaves the old value alone. Nothing here reads a property after writing to it (reads are stale), nothing goes through
+    // setFieldValue() (which sends date-looking text through setFromDate), and a record GUID is only ever written to a record field.
+    //
+    //   persisted   writes
+    //   text, url, hashtag   the string form (one-value field: several values are joined with ", "; many: one value each)
+    //   number      every value must be a number (else warning); one-value field takes one
+    //   datetime    every value must parse (_planDateOf, else warning); one-value field takes one
+    //   choice      many: tokens (_planChoiceTokens), each an existing option (pass 1 added the missing ones);
+    //               single: the whole value is one token
+    //   record      only resolved links, in pass 3; a plain value or a link that stays unresolved is left alone (warning for the former)
+    //   anything else (user, file, image, banner, dynamic): warning, nothing written
+
+    _planWriteSourcePath(ctx, def, record) {
+        let ok = false;
         try {
-            const list = Array.isArray(value) ? value.filter(v => v !== null && v !== undefined && v !== '') : [value];
-            const values = list.map(v => this._planDateValue(v));
-            if (values.length === 0 || values.some(v => v === null)) return null;
+            const prop = record.prop('source_path');
+            if (prop) { prop.set(def.sourcePath); ok = true; }
+        } catch (e) { /* reported below */ }
+        if (!ok && def.sourcePath) {
+            ctx.report.warnings.push({ code: 'property-not-set', message: 'source_path not set', record: def.key, field: 'source_path' });
+        }
+    }
+
+    /** Writes the scalar values of a record, and the source text of its property links where the persisted field is not a record field. */
+    _planWriteValues(ctx, entry, def, record) {
+        const schema = entry.schema || new Map();
+        const links = this._planPropertyLinks(ctx).get(def.key) || new Map();
+        const fieldIds = Object.keys(def.values || {});
+        for (const fieldId of links.keys()) if (!fieldIds.includes(fieldId)) fieldIds.push(fieldId);
+        const warn = (fieldId, message) => ctx.report.warnings.push({ code: 'property-not-set', message: `${fieldId}: ${message}; left unchanged`, record: def.key, field: fieldId });
+        for (const fieldId of fieldIds) {
+            const value = (def.values || {})[fieldId];
+            const own = this._planFlatPresent([value]);
+            const fieldLinks = links.get(fieldId) || [];
+            if (own.length === 0 && fieldLinks.length === 0) continue;
+            const persisted = schema.get(fieldId);
+            if (!persisted) {
+                if (own.length) warn(fieldId, 'the collection has no such field');
+                continue;   // links to a missing field are reported by pass 3
+            }
+            if (persisted.type === 'record') {
+                if (own.length) warn(fieldId, `a record field in the collection, but "${own[0]}" is plain text with no link to a record`);
+                continue;   // links are written in pass 3, once every record exists
+            }
+            const items = [...(value === undefined ? [] : [value]), ...fieldLinks.map(link => this._planLinkRaw(link))];
+            this._planWriteField(ctx, def, record, fieldId, persisted, items, warn);
+        }
+    }
+
+    /** One field, coerced to its persisted definition (see the table above). items: scalars / arrays / link source text. */
+    _planWriteField(ctx, def, record, fieldId, persisted, items, warn) {
+        const flat = this._planFlatPresent(items);
+        if (flat.length === 0) return;
+        const many = persisted.many;
+        let method = 'set';
+        let value;
+        switch (persisted.type) {
+            case 'text':
+            case 'url':
+            case 'hashtag': {
+                const strings = flat.map(v => String(v));
+                value = many ? strings : strings.join(', ');
+                break;
+            }
+            case 'number': {
+                const numbers = flat.map(v => (typeof v === 'number' ? (Number.isFinite(v) ? v : null) : this.coerceNumber(String(v))));
+                const bad = numbers.findIndex(n => n === null);
+                if (bad >= 0) return warn(fieldId, `"${flat[bad]}" is not a number (the field is a number field)`);
+                if (!many && numbers.length > 1) return warn(fieldId, `${numbers.length} values for a one-value number field`);
+                value = many ? numbers : numbers[0];
+                break;
+            }
+            case 'datetime': {
+                const dates = flat.map(v => this._planDateOf(v));
+                const bad = dates.findIndex(d => d === null);
+                if (bad >= 0) return warn(fieldId, `"${flat[bad]}" is not a date this importer can read (the field is a date field)`);
+                if (!many && dates.length > 1) return warn(fieldId, `${dates.length} values for a one-value date field`);
+                value = many ? dates : dates[0];
+                break;
+            }
+            case 'choice': {
+                const options = new Map(persisted.choices.map(c => [c.label.toLowerCase(), c.label]));
+                const tokens = this._planChoiceTokens(items, many);
+                if (tokens.length === 0) return;
+                const missing = tokens.find(t => !options.has(t.toLowerCase()));
+                if (missing !== undefined) return warn(fieldId, `the choice field has no option "${missing}"`);
+                const labels = tokens.map(t => options.get(t.toLowerCase()));
+                method = 'setChoice';
+                value = many ? labels : labels[0];
+                break;
+            }
+            default:
+                return warn(fieldId, `the field is of type "${persisted.type}", which an import does not write`);
+        }
+        try {
             const prop = record.prop(fieldId);
-            if (!prop) return false;
-            const multi = typeof prop.isMultiValue === 'function' && prop.isMultiValue();
-            if (values.length > 1 && !multi) return false;
-            prop.set(Array.isArray(value) && multi ? values : values[0]);   // set(): types.d.ts:2995
-            return true;
-        } catch (e) {
-            return false;
+            if (!prop) return warn(fieldId, 'the record has no such property');
+            if (method === 'setChoice') {
+                if (typeof prop.setChoice !== 'function' || !prop.setChoice(value)) return warn(fieldId, 'the choice could not be set');
+            } else {
+                prop.set(value);   // types.d.ts:2995
+            }
+        } catch (error) {
+            warn(fieldId, `could not be set: ${error && error.message || error}`);
         }
     }
 
@@ -6281,6 +6608,7 @@ class Plugin extends AppPlugin {
             const entry = ctx.records.get(key);
             ctx.progress(3, `Links in ${entry ? entry.def.title : key}`, done += own.length, links.length);
             if (!entry) continue; // the record itself failed in pass 2 and is already in report.errors
+            if (entry.skipped) continue; // existing: 'skip': an existing record is not written to at all (it stays in the index as a link target)
 
             try {
                 await this._planApplyPropertyLinks(ctx, entry, own.filter(l => l.where === 'property'));
@@ -6304,6 +6632,11 @@ class Plugin extends AppPlugin {
             byField.get(link.field).push(link);
         }
         for (const [fieldId, fieldLinks] of byField) {
+            const collection = ctx.collections.get(entry.def.collection);
+            const persisted = collection && collection.schema && collection.schema.get(fieldId);
+            // A field that is not a record field in the workspace cannot hold a reference (a GUID there would be an opaque
+            // string): pass 2 wrote the link's source text to it instead.
+            if (persisted && persisted.type !== 'record') continue;
             const guids = [];
             for (const link of fieldLinks) {
                 const result = this._planResolveLink(ctx, link);
@@ -6386,7 +6719,7 @@ class Plugin extends AppPlugin {
         let done = 0;
         for (const [key, own] of byRecord) {
             const entry = ctx.records.get(key);
-            if (!entry) continue;
+            if (!entry || entry.skipped) continue;   // existing: 'skip' leaves an existing record's body (and so its images) alone
             try {
                 await this._planInsertAssets(ctx, entry, own);
             } catch (error) {

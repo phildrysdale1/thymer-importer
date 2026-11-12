@@ -82,13 +82,24 @@ test('many-valued datetime fields take an array of DateTimeValues; a single-valu
     assert.deepEqual(report.warnings.map(w => w.field), ['due']);
 });
 
-test('a datetime string this engine cannot parse falls back to the generic setter instead of being dropped', async () => {
+test('a datetime string outside the plan forms is parsed or warned about, and never goes through setFromDate', async () => {
     const { thymer, plugin } = setup();
+    // an ISO instant with a zone: the local wall-clock time, written with DateTime.dateAndTime (not a fromDate value)
     const report = await plugin.applyImportPlan(datePlan(plugin, { due: '2026-03-01T10:00:00Z' }), fast);
     assert.deepEqual(report.errors, []);
+    assert.deepEqual(report.warnings, []);
     const v = thymer.recordByTitle('Dates', 'Row').prop('due').values()[0];
-    assert.equal(v.fromDate, true, 'went through the existing setFieldValue path');
+    const instant = new Date('2026-03-01T10:00:00Z');
+    const pad = (n) => String(n).padStart(2, '0');
+    assert.deepEqual(v, { d: `${instant.getFullYear()}${pad(instant.getMonth() + 1)}${pad(instant.getDate())}`, t: `${pad(instant.getHours())}${pad(instant.getMinutes())}${pad(instant.getSeconds())}` });
+    assert.equal(v.fromDate, undefined);
     assert.equal(new Date('2026-03-01').getDate(), 28, 'sanity: TZ is west of UTC, so a UTC-midnight Date is the previous evening');
+
+    // text that is not a date: a warning, and the value that was there stays
+    const again = await plugin.applyImportPlan(datePlan(plugin, { due: 'sometime soon' }), fast);
+    assert.equal(again.warnings.filter(w => w.code === 'property-not-set' && w.field === 'due').length, 1);
+    assert.deepEqual(thymer.recordByTitle('Dates', 'Row').prop('due').values(), [v], 'unchanged');
+    assert.ok(thymer.writeLog.every(w => !w.value.some || !w.value.some(x => x && x.fromDate)), 'setFromDate was never used');
 });
 
 test('Tolaria fixture: `due: 2026-03-01` is stored as the date 20260301, no time, not Feb 28', async () => {
