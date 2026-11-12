@@ -1,6 +1,48 @@
 # Changelog — Thymer Importer
 
-Tracks **`plugin.js`** / **`plugin.json`** behavior. Current release: **v0.0.12** (see **`VERSION`** in **`plugin.js`**).
+Tracks **`plugin.js`** / **`plugin.json`** behavior. Current release: **v0.0.13** (see **`VERSION`** in **`plugin.js`**).
+
+---
+
+## v0.0.13 — Tolaria and Notion export sources, shared ImportPlan engine
+
+### New sources
+
+**Import Markdown** has two new sources, **Tolaria** and **Notion export**. Both build their own collections, so the collection picker and the journal option are hidden for them.
+
+- **Tolaria** (a vault of `*.md` files with YAML frontmatter): notes with **`type: Type`** define collections (name from **`sidebar label`**, icon from **`_icon`**, body → description) and every other note becomes a record in the collection of its **`type:`**. Frontmatter keys whose values are all **`[[wikilinks]]`** become record-reference properties, **`[[slug]]`** links in the body become record references (matched by file name), and **`attachments/`** images are uploaded and inserted as images. Tolaria UI state (**`_*`**, **`visible`**, **`color`**), agent docs (**`AGENTS.md`**, **`CLAUDE.md`**, …) and dot-folders are skipped.
+- **Notion export** (unzipped **Markdown & CSV** export, subpages included): each database becomes a collection, each row a record, and standalone pages go to a **Notion Pages** collection. Column types are detected from the CSV, relation columns (Notion page URLs) become record references resolved by page id across every database in the folder, and `<aside>` callouts become quotes. Title id suffixes are dropped.
+- Both show an **import report** when done: collections and records created or updated, links resolved or left as text, images uploaded, and anything skipped or failed.
+- Re-importing is safe: records are matched by **`source_path`** and updated in place.
+
+### Shared ImportPlan engine
+
+- A source parser is a pure function that returns an **ImportPlan** (collections, records, property values, links, assets). **`applyImportPlan()`** performs every Thymer write: collections (name, icon, description, fields), records, links, images, then journal entries.
+- **`LinkIndex`** maps paths, file-name slugs, Notion page ids and titles to records, so links and relation properties are rewritten after every record exists.
+- The existing CSV, Obsidian, Joplin, Logseq and journal flows do not use the engine and are unchanged.
+
+### Date-only values on the new path
+
+Date-only values (`2026-03-01`, Notion's `August 30, 2021`) are written with **`DateTime.dateOnly`**, so they no longer shift by the UTC offset; values with a time keep it, and Notion date ranges are imported as ranges.
+
+### Folder picker for the new sources
+
+In Thymer Desktop **`showDirectoryPicker()`** rejects with **`AbortError`** even after a folder was chosen, which looks like a cancel. Tolaria and Notion therefore use **`pickFolderViaInput()`** (`<input type="file" webkitdirectory>`), which works in Thymer Desktop and in browsers. The other sources still use **`pickFolder()`**.
+
+### Name-clash warning
+
+The importer finds target collections by name, so a workspace that already had a **Notes** or **Projects** collection would silently receive the import. Before writing anything, Tolaria and Notion now compare the planned collection names with the workspace:
+
+- A same-named collection counts as **a previous import from this source** when it has a **`source_path`** field and one of its records has a **`source_path`** of a planned record. It is merged into silently, so re-import keeps working.
+- Any other same-named collection is a **clash**. The dialog lists the clashes and asks:
+  - **Import into separate collections** (default): every planned collection gets an editable prefix (**`Tolaria · `** / **`Notion · `**), so the source stays together. Importing again with the same prefix updates those collections.
+  - **Merge into existing collections**: the previous behavior.
+- No clash, no extra step.
+
+### Tests
+
+- **`npm test`** runs a Node test harness (Node 20+, no dependencies) that loads **`plugin.js`** with a stub **`AppPlugin`** and an in-memory Thymer API. Fixtures are synthetic. See **`test/README.md`**.
+- Optional env vars run the parsers over real exports: **`TOLARIA_VAULT`**, **`NOTION_EXPORT`**, **`NOTION_EXPECT`**.
 
 ---
 

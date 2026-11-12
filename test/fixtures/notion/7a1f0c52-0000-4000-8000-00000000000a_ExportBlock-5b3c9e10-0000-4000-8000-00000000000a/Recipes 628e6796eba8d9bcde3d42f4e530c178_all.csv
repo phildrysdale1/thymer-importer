@@ -1,0 +1,7 @@
+﻿Name,Cuisine,Ingredients,Made On,Pairs With,Rating,Source,Tags,Vegetarian
+Pancakes,American,"https://www.notion.so/Flour-34ed21acfd45b8e069ad582906e8c710, https://www.notion.so/Eggs-af89f6101d60d2eae82d3133e9321a91","March 3, 2024",Milk,4,https://example.invalid/pancakes,"Breakfast, Sweet",Yes
+Waffles,Belgian,https://app.notion.com/p/af89f6101d60d2eae82d3133e9321a91?pvs=21,"April 1, 2024 3:30 PM",Milk,5,https://example.invalid/waffles,Breakfast,Yes
+Ratatouille,French,"https://www.notion.so/Saffron-f74d01e83a5195444ac591267082e2f5, https://www.notion.so/Flour-34ed21acfd45b8e069ad582906e8c710",,Eggs,3,,"Dinner, Vegetarian",Yes
+Soup ,French,"Flour, Eggs",,Flour,,https://example.invalid/soup,Dinner,No
+,American,,"May 9, 2024 → May 10, 2024",Eggs,2,,"Dinner, Sweet",No
+Tea,Belgian,,,Milk,1,,"Breakfast, Drinks",Yes
