@@ -39,6 +39,17 @@ The importer finds target collections by name, so a workspace that already had a
   - **Merge into existing collections**: the previous behavior.
 - No clash, no extra step.
 
+### Review fixes
+
+Fixes from the review of the pull request, all on the new sources and the shared engine (the existing CSV, Obsidian, Joplin, Logseq and journal flows are unchanged):
+
+- **Notion, id-suffixed rows folder:** some exports name the rows folder after the whole csv file (**`Tasks <id>/`** next to **`Tasks <id>.csv`**). The folder is found by the full csv stem, then the name without the id, then a sibling folder carrying the database id, then the sanitised-name fallback, so row pages are claimed instead of landing in **Notion Pages** as empty rows.
+- **Notion, rows without a page:** two csv rows with the same title and no page shared one **`source_path`**, and the second overwrote the first. The second, third, … get **`#2`**, **`#3`** after the title (in csv order); the first keeps its old path, so earlier imports still match. The report lists the affected titles.
+- **Re-import matches by `source_path` alone:** a note whose title changed but whose file did not is updated, not duplicated. Records with no **`source_path`** are still adopted by title, once. If the title changed, the record is **renamed** through its built-in title property (**`record.prop('Title').set(...)`**, then **`'title'`**) and counted as **renamed** in the report; if that is not possible it is a **`title-not-renamed`** warning and the record keeps its old title.
+- **Choices on re-import:** when the field that already exists in Thymer is a choice, new values are added as options even if this run infers a text column. Existing fields are never retyped.
+- **Tolaria field ids:** keys that slugify alike (**`cost ($)`**, **`cost (%)`**) get distinct ids (**`cost`**, **`cost_2`**), allocated in sorted key order so a re-import maps to the same fields. Case variants (**`Status`** / **`status`**) still share one field.
+- **Cleared values:** on an updated record, a field the plan declares for that collection is **cleared** when the source has no value for it any more (an emptied cell, a removed frontmatter key, a relation that is gone). Only declared fields are touched: fields you added in Thymer, **`source_path`**, built-in/system fields and read-only fields are left alone. A declared column that is missing from the export entirely also clears, because the plan declares it and the source is the truth; if you keep your own data in a field that a source also declares, it is replaced on re-import. Clearing is a single **`set([])`** (multi-value) or **`set(null)`** call per property; what needs clearing is read before the record is written, because Thymer's reads right after a write are stale. The number of cleared values is in the import report.
+
 ### Tests
 
 - **`npm test`** runs a Node test harness (Node 20+, no dependencies) that loads **`plugin.js`** with a stub **`AppPlugin`** and an in-memory Thymer API. Fixtures are synthetic. See **`test/README.md`**.

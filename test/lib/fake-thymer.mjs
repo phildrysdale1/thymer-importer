@@ -58,12 +58,25 @@ class FakeProperty {
         this.name = field.label;
         this.guid = `${record.guid}:${field.id}`;
     }
+    // _values is storage (what the workspace holds). Reads (count(), values(), text(), ...) go through _read, which with
+    // thymer.staleReads returns what the property held BEFORE the first write since thymer.settle(): in Thymer, reads
+    // right after a write return the old values, even for seconds. Mutators that build on a read (removeValue,
+    // removeValueAt) therefore write back a modified copy of the stale list, as the real ones were seen to do.
     get _values() { return this._record._values.get(this._field.id) || []; }
     set _values(v) { this._record._values.set(this._field.id, v); }
+    get _read() {
+        const stale = this._record._stale;
+        return this._thymer.staleReads && stale.has(this._field.id) ? stale.get(this._field.id) : this._values;
+    }
+    _write(v) {
+        if (this._thymer.staleReads && !this._record._stale.has(this._field.id)) this._record._stale.set(this._field.id, this._values.slice());
+        this._values = v;
+        this._thymer.writeLog.push({ record: this._record.guid, field: this._field.id, value: v });
+    }
 
     isMultiValue() { return this._field.many === true; }
-    count() { return this._values.length; }
-    values() { return this._values.slice(); }
+    count() { return this._read.length; }
+    values() { return this._read.slice(); }
 
     _coerce(v) {
         switch (this._field.type) {
@@ -88,16 +101,32 @@ class FakeProperty {
     }
 
     set(v) {
+        if (v === null || v === undefined) { this._write([]); return; }   // verified live: set(null) clears a single-value property
         if (Array.isArray(v)) {
             if (!this.isMultiValue()) throw new Error(`${this._field.id} is single-value; cannot set an array`);
-            this._values = v.map(x => this._coerce(x));
+            this._write(v.map(x => this._coerce(x)));
         } else {
-            this._values = [this._coerce(v)];
+            this._write([this._coerce(v)]);
         }
     }
     addValue(v) {
         if (!this.isMultiValue()) return this.set(v);
-        this._values = [...this._values, this._coerce(v)];
+        this._write([...this._read, this._coerce(v)]);
+    }
+    /** types.d.ts:3007: removes a value by strict equality; clears a single-value property if it matches. */
+    removeValue(v) {
+        const list = this._read;
+        const i = list.findIndex(x => x === v);
+        if (i < 0) return false;
+        this._write(list.filter((_, j) => j !== i));
+        return true;
+    }
+    /** types.d.ts:3014 */
+    removeValueAt(index) {
+        const list = this._read;
+        if (!Number.isInteger(index) || index < 0 || index >= list.length) return false;
+        this._write(list.filter((_, j) => j !== index));
+        return true;
     }
     setFromDate(date) {
         const dates = Array.isArray(date) ? date : [date];
@@ -106,11 +135,11 @@ class FakeProperty {
         // ("2026-03-01" parses as UTC midnight, so it lands on the previous evening west of UTC).
         // fromDate marks values that came through here.
         const pad = (n) => String(n).padStart(2, '0');
-        this._values = dates.map(d => ({
+        this._write(dates.map(d => ({
             d: `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`,
             t: `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`,
             fromDate: true
-        }));
+        })));
     }
     setChoice(names) {
         if (this._field.type !== 'choice') return false;
@@ -122,16 +151,16 @@ class FakeProperty {
             if (!c) return false;
             ids.push(c.id);
         }
-        this._values = ids;
+        this._write(ids);
         return true;
     }
 
-    text() { const v = this._values[0]; return v === undefined || v === null ? null : String(v); }
-    texts() { return this._values.map(String); }
-    number() { const v = this._values[0]; return typeof v === 'number' ? v : null; }
-    numbers() { return this._values.filter(v => typeof v === 'number'); }
-    choice() { return this._field.type === 'choice' ? (this._values[0] ?? null) : null; }
-    selectedChoices() { return this._field.type === 'choice' ? this._values.slice() : []; }
+    text() { const v = this._read[0]; return v === undefined || v === null ? null : String(v); }
+    texts() { return this._read.map(String); }
+    number() { const v = this._read[0]; return typeof v === 'number' ? v : null; }
+    numbers() { return this._read.filter(v => typeof v === 'number'); }
+    choice() { return this._field.type === 'choice' ? (this._read[0] ?? null) : null; }
+    selectedChoices() { return this._field.type === 'choice' ? this._read.slice() : []; }
     choiceLabel() {
         const c = (this._field.choices || []).find(o => o.id === this.choice());
         return c ? c.label : null;
@@ -140,7 +169,7 @@ class FakeProperty {
         return this.selectedChoices().map(id => ((this._field.choices || []).find(o => o.id === id) || {}).label);
     }
     linkedRecords() {
-        return this._field.type === 'record' ? this._values.map(g => this._thymer.records.get(g)).filter(Boolean) : [];
+        return this._field.type === 'record' ? this._read.map(g => this._thymer.records.get(g)).filter(Boolean) : [];
     }
     linkedRecord() { return this.linkedRecords()[0] || null; }
 }
@@ -209,11 +238,17 @@ export class FakeRecord {
         this.guid = nextGuid('rec');
         this._title = title;
         this._values = new Map();
+        this._stale = new Map();          // field id -> values before the first write since thymer.settle()
+        this._staleTitle = undefined;
         this._rootItems = [];
         this._itemsByGuid = new Map();
         this._visibleAfterReads = 0;
     }
-    getName() { return this._title; }
+    getName() { return this._thymer.staleReads && this._staleTitle !== undefined ? this._staleTitle : this._title; }
+    _setTitle(name) {
+        if (this._thymer.staleReads && this._staleTitle === undefined) this._staleTitle = this._title;
+        this._title = String(name);
+    }
 
     _field(name) {
         const fields = (this._collection.config.fields || []).filter(f => f.active !== false);
@@ -221,7 +256,13 @@ export class FakeRecord {
     }
     prop(name) {
         const field = this._field(name);
-        return field ? new FakeProperty(this._thymer, this, field) : null;
+        if (field) return new FakeProperty(this._thymer, this, field);
+        // the built-in title property (live: record.prop('Title').set('new name') renames the record)
+        if (this._thymer.titleProps.includes(name)) {
+            const record = this;
+            return { name: 'Title', guid: `${this.guid}:title`, isMultiValue: () => false, count: () => (record.getName() ? 1 : 0), values: () => [record.getName()], text: () => record.getName(), set(v) { record._setTitle(v); } };
+        }
+        return null;
     }
     text(name) { const p = this.prop(name); return p ? p.text() : null; }
     texts(name) { const p = this.prop(name); return p ? p.texts() : []; }
@@ -338,6 +379,9 @@ export class FakeThymer {
         this.blobs = new Map();
         this.failCreateTitles = new Set();
         this.failUploadNames = new Set();
+        this.writeLog = [];               // every property write: { record, field, value }
+        this.staleReads = false;          // model Thymer's stale reads right after a write (see settle())
+        this.titleProps = ['Title'];      // names under which record.prop() finds the built-in title property
         this.rejected = [];               // reasons setSegments() refused a segment list
         this.expandingGetLineItems = 0;   // getLineItems() calls that did not pass false
         this.users = [{ guid: 'user1' }];
@@ -376,6 +420,11 @@ export class FakeThymer {
         };
     }
 
+    /** Time passes: reads now see what was written (only matters with staleReads). */
+    settle() {
+        for (const r of this.records.values()) { r._stale.clear(); r._staleTitle = undefined; }
+    }
+
     collection(name) { return this.collections.find(c => c.getName() === name) || null; }
 
     /** Records of a collection as plain data, for assertions. */
@@ -386,7 +435,7 @@ export class FakeThymer {
             if (r._collection !== c) continue;
             out.push({
                 guid: r.guid,
-                title: r.getName(),
+                title: r._title,
                 items: r._flat().map(i => ({ type: i.type, text: i.text, segments: i.segments, parent: i.parent_guid, props: i.props }))
             });
         }
@@ -394,6 +443,6 @@ export class FakeThymer {
     }
     recordByTitle(collectionName, title) {
         const c = this.collection(collectionName);
-        return Array.from(this.records.values()).find(r => r._collection === c && r.getName() === title) || null;
+        return Array.from(this.records.values()).find(r => r._collection === c && r._title === title) || null;
     }
 }

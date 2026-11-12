@@ -4,6 +4,7 @@ const VERSION = 'v0.0.13';
  * Supports CSV, Obsidian Markdown, Joplin (YAML frontmatter), and Logseq imports with UI
  * 
  * v0.0.13 - New sources Tolaria (vault with typed notes) and Notion export (Markdown & CSV, one collection per database) on a shared ImportPlan engine (record references, link index, images, date-only values via DateTime.dateOnly); they use an <input webkitdirectory> folder picker (works in Thymer Desktop); a same-named existing collection that is not a previous import asks first: separate (prefixed) collections or merge; Node test harness (npm test)
+ * v0.0.13 (review fixes) - Notion: rows folder named with the database id is claimed, page-less rows with the same title keep distinct source paths (#2, #3); Tolaria: collision-free field ids (cost, cost_2); re-import matches by source_path alone (a changed title renames the record via its Title property, no duplicate), persisted choice fields gain new options whatever the inference says, and values removed from the source are cleared on update (counted in the report)
  * v0.0.12 - Create New Collection: frontmatter keys tag / tags get property type hashtag (many: true when values are YAML lists)
  * v0.0.11 - Markdown folder picker: use pickFolder() like journal import (showDirectoryPicker without startIn + webkitdirectory fallback for Safari/macOS); scanVaultFiles supports file-list result
  * v0.0.10 - Optional plugin.json custom.markdown_import_hashtag_escape (default true): set false to disable v0.0.9 hashtag-like token escaping
@@ -4174,6 +4175,28 @@ class Plugin extends AppPlugin {
         const props = new Map();       // field id -> { id, variants, items, list, relationKey }
         const noteProps = new Map();   // note -> Map(field id -> raw value)
         const fieldIds = new Map();    // lowercased key -> id
+        // Field ids: one per distinct lowercased key (Status / status share one). slugify() is lossy ("cost ($)" and
+        // "cost (%)" are both "cost"), so ids are made unique ("cost", "cost_2"). They are allocated up front in sorted
+        // key order, not in the order notes happen to be read, so the same vault always maps to the same ids and a
+        // re-import finds the fields it created.
+        const keysWithValues = new Set();
+        for (const note of notes) {
+            for (const [key, raw] of Object.entries(note.frontmatter)) {
+                const lower = key.trim().toLowerCase();
+                if (lower === 'type' || lower.startsWith('_') || DROP.has(lower)) continue;
+                if ((Array.isArray(raw) ? raw : [raw]).some(v => v !== null && v !== undefined && String(v).trim() !== '')) keysWithValues.add(lower);
+            }
+        }
+        const takenIds = new Set();
+        let unnamedKeys = 0;
+        for (const lower of Array.from(keysWithValues).sort()) {
+            let base = this.slugify(lower) || `field_${++unnamedKeys}`;
+            if (base === 'source_path') base = 'source_path_value';
+            let id = base;
+            for (let n = 2; takenIds.has(id); n++) id = `${base}_${n}`;
+            takenIds.add(id);
+            fieldIds.set(lower, id);
+        }
         for (const note of notes) {
             const mine = new Map();
             noteProps.set(note, mine);
@@ -4183,11 +4206,6 @@ class Plugin extends AppPlugin {
                 if (lower.startsWith('_') || DROP.has(lower)) { report.droppedKeys[key] = (report.droppedKeys[key] || 0) + 1; continue; }
                 const items = (Array.isArray(raw) ? raw : [raw]).filter(v => v !== null && v !== undefined && String(v).trim() !== '').map(v => String(v).trim());
                 if (items.length === 0) continue;
-                if (!fieldIds.has(lower)) {
-                    let id = this.slugify(lower) || `field_${fieldIds.size + 1}`;
-                    if (id === 'source_path') id = 'source_path_value';
-                    fieldIds.set(lower, id);
-                }
                 const id = fieldIds.get(lower);
                 if (!props.has(id)) props.set(id, { id, variants: new Set(), items: [], list: false });
                 const prop = props.get(id);
@@ -4385,7 +4403,8 @@ class Plugin extends AppPlugin {
         };
         add('div', failed ? 'Import finished with problems' : 'Import complete', 'font-weight: 600;');
         add('div', `Collections: ${c.collectionsCreated} created, ${c.collectionsUpdated} updated`);
-        add('div', `Records: ${c.recordsCreated} created, ${c.recordsUpdated} updated${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`);
+        add('div', `Records: ${c.recordsCreated} created, ${c.recordsUpdated} updated${c.recordsRenamed ? ` (${c.recordsRenamed} renamed)` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`);
+        if (c.valuesCleared) add('div', `Values cleared (gone from the source): ${c.valuesCleared}`);
         add('div', `Links: ${c.linksResolved} resolved, ${c.linksUnresolved} unresolved`);
         add('div', `Images: ${c.assetsUploaded} uploaded${c.assetsFailed ? `, ${c.assetsFailed} failed` : ''}`);
         if (p.unusedTypes && p.unusedTypes.length) add('div', `Types with no notes (no collection created): ${p.unusedTypes.join(', ')}`, 'margin-top: 8px; font-size: 12px;');
@@ -4613,7 +4632,8 @@ class Plugin extends AppPlugin {
                 info.rowsOnlyInPlain = plain.rows.filter(r => !have.has(this._notionNormTitle(r[0]))).length;
             }
             dbs.push({
-                id: m ? m[2].toLowerCase() : null, name, dir, rowsDir: dir ? `${dir}/${name}` : name,
+                id: m ? m[2].toLowerCase() : null, name, dir, stem: g.stem, rowsDir: dir ? `${dir}/${name}` : name,
+                pathBase: dir ? `${dir}/${name}` : name,   // id-free prefix for the source_path of rows that have no page
                 titleHeader, headers, rows, info, pages: [], records: [], orphans: []
             });
         }
@@ -4898,6 +4918,25 @@ class Plugin extends AppPlugin {
 
     // ---- plan ----------------------------------------------------------------
 
+    /**
+     * The folder that holds a database's row pages. Exports differ: most name it after the database ("Tasks/"), some
+     * after the whole csv file ("Tasks <id>/" next to "Tasks <id>.csv"). Tried in order, taking the first folder that
+     * has pages: the full csv stem; the name without the id; a sibling folder carrying the database id; a sibling that
+     * reads the same once Notion's different character sanitising is ignored. Falls back to the plain name
+     * (the folder then simply has no pages). `dirs` is the set of folders that contain pages.
+     */
+    _notionFindRowsDir(db, dirs, slug) {
+        const parentOf = (d) => d.split('/').slice(0, -1).join('/');
+        const lastOf = (d) => d.split('/').pop();
+        const siblings = Array.from(dirs).filter(d => parentOf(d) === db.dir);
+        const plain = db.dir ? `${db.dir}/${db.name}` : db.name;
+        if (dirs.has(db.stem)) return db.stem;
+        if (dirs.has(plain)) return plain;
+        const byId = db.id && siblings.find(d => lastOf(d).toLowerCase().includes(db.id));
+        if (byId) return byId;
+        return siblings.find(d => slug(lastOf(d)) === slug(db.name)) || plain;
+    }
+
     _notionBuildPlan({ files, texts }, options = {}) {
         const plan = this.createImportPlan('notion');
         const diag = plan.parseReport = {
@@ -4927,12 +4966,7 @@ class Plugin extends AppPlugin {
         const slug = (t) => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
         for (const db of dbs) {
             const headerSet = new Set(db.headers);
-            if (!Array.from(pages.values()).some(p => p.dir === db.rowsDir)) {
-                // Notion sanitises characters in folder names differently from the csv's: fall back to a sibling folder that reads the same
-                const alt = Array.from(new Set(Array.from(pages.values()).map(p => p.dir)))
-                    .find(d => d.split('/').slice(0, -1).join('/') === db.dir && slug(d.split('/').pop()) === slug(db.name));
-                if (alt) db.rowsDir = alt;
-            }
+            db.rowsDir = this._notionFindRowsDir(db, new Set(Array.from(pages.values()).map(p => p.dir)), slug);
             for (const page of pages.values()) {
                 if (page.dir !== db.rowsDir) continue;
                 Object.assign(page, this._notionSplitPropertyBlock(page, headerSet));
@@ -4951,22 +4985,41 @@ class Plugin extends AppPlugin {
                 csv: { plain: db.info.plainCsv, all: db.info.allCsv, rowsPlain: db.info.rowsPlain, rowsAll: db.info.rowsAll,
                     columnsOnlyInAll: db.info.headersOnlyInAll, columnsOnlyInPlain: db.info.headersOnlyInPlain, rowsOnlyInPlain: db.info.rowsOnlyInPlain || 0 },
                 rows: db.rows.length, pages: db.pages.length, matched: 0,
-                rowsWithoutPage: [], pagesWithoutRow: [], emptyColumns: [], relationColumnsOutsideExport: [],
+                rowsWithoutPage: [], duplicateRowsWithoutPage: [], pagesWithoutRow: [], emptyColumns: [], relationColumnsOutsideExport: [],
                 dateRangesTruncated: 0, dateRangesKept: 0, columns: []
             };
             diag.databases.push(db.diag);
+            // Rows without a page have no file to identify them. Their source_path is "<database>/<title>" (stable and id-free:
+            // the csv's id would alias the database). Rows that share a title would share that path, and the engine would
+            // overwrite the first with the second, so the 2nd, 3rd, ... occurrence among page-less rows with the same
+            // title gets "#2", "#3", ... in CSV order. The first keeps the plain path, so earlier imports still dedupe.
+            const pagelessSeen = new Map();   // lowercased title -> { title, count }
+            const pagelessPaths = new Set();
             for (const row of db.rows) {
                 const page = row.page;
                 const title = row.title || (page && (page.h1 || page.fileTitle)) || 'Untitled';
+                let sourcePath;
+                if (page) {
+                    sourcePath = page.path;
+                } else {
+                    const seen = pagelessSeen.get(title.trim().toLowerCase()) || { title, count: 0 };
+                    pagelessSeen.set(title.trim().toLowerCase(), seen);
+                    do {
+                        seen.count++;
+                        sourcePath = `${db.pathBase}/${title}${seen.count > 1 ? `#${seen.count}` : ''}`;
+                    } while (pagelessPaths.has(sourcePath.toLowerCase()));
+                    pagelessPaths.add(sourcePath.toLowerCase());
+                }
                 const rec = {
                     key: page && page.id ? `notion:${page.id}` : `notion:${db.id || db.name}:row:${++rowCounter.n}`,
-                    collection: db.key, title,
-                    sourcePath: page ? page.path : `${db.rowsDir}/${title}`,   // a row with no page: stable and id-free (the csv's id would alias the database)
+                    collection: db.key, title, sourcePath,
                     row, page, dir: page ? page.dir : db.rowsDir
                 };
                 if (page) db.diag.matched++; else db.diag.rowsWithoutPage.push(title);
                 db.records.push(rec);
             }
+            db.diag.duplicateRowsWithoutPage = Array.from(pagelessSeen.values()).filter(x => x.count > 1)
+                .map(x => ({ title: x.title, count: x.count, paths: Array.from({ length: x.count }, (_, i) => `${db.pathBase}/${x.title}${i ? `#${i + 1}` : ''}`) }));
             for (const page of db.orphans) {
                 db.diag.pagesWithoutRow.push({ path: page.path, title: page.h1 || page.fileTitle });
                 db.records.push({
@@ -5129,7 +5182,8 @@ class Plugin extends AppPlugin {
 
         const counts = [
             `Collections: ${c.collectionsCreated || 0} created, ${c.collectionsUpdated || 0} updated`,
-            `Records: ${c.recordsCreated || 0} created, ${c.recordsUpdated || 0} updated${c.recordsSkipped ? `, ${c.recordsSkipped} skipped` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`,
+            `Records: ${c.recordsCreated || 0} created, ${c.recordsUpdated || 0} updated${c.recordsRenamed ? ` (${c.recordsRenamed} renamed)` : ''}${c.recordsSkipped ? `, ${c.recordsSkipped} skipped` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`,
+            ...(c.valuesCleared ? [`Values cleared (gone from the source): ${c.valuesCleared}`] : []),
             `Links: ${c.linksResolved || 0} resolved, ${c.linksUnresolved || 0} unresolved`,
             `Images/files: ${c.assetsUploaded || 0} uploaded${c.assetsFailed ? `, ${c.assetsFailed} failed` : ''}`
         ];
@@ -5143,6 +5197,8 @@ class Plugin extends AppPlugin {
         section('Columns that name rows of another database by title (left as text)', 'info',
             (pr.linkByTitleCandidates || []).map(x => `${x.collection}.${x.column} → ${x.targetName}: ${x.matched} of ${x.total} values (${pct(x.share)})${x.ofLeftOverText ? ' of the text cells' : ''}`));
         section('Rows without a page', 'info', dbs.flatMap(d => d.rowsWithoutPage.map(t => `${d.name}: ${t}`)));
+        section('Rows without a page that share a title (kept as separate records; the later ones are matched on re-import by their order in the CSV, source paths …#2, …#3)', 'warning',
+            dbs.flatMap(d => (d.duplicateRowsWithoutPage || []).map(x => `${d.name}: "${x.title}" × ${x.count} (${x.paths.map(p => p.split('/').pop()).join(', ')})`)));
         section('Pages without a CSV row (imported as records)', 'info', dbs.flatMap(d => d.pagesWithoutRow.map(p => `${d.name}: ${p.title}`)));
         section('Empty columns (not imported)', 'info', dbs.flatMap(d => d.emptyColumns.map(h => `${d.name}.${h}`)));
         section('Missing images/files (left as text)', 'warning', ((pr.assets && pr.assets.missing) || []).map(x => `${x.from}: ${x.path}`));
@@ -5550,7 +5606,8 @@ class Plugin extends AppPlugin {
                 recordsCreated: 0, recordsUpdated: 0, recordsSkipped: 0, recordsFailed: 0,
                 linksResolved: 0, linksUnresolved: 0,
                 assetsUploaded: 0, assetsFailed: 0,
-                journalCreated: 0, journalSkipped: 0
+                journalCreated: 0, journalSkipped: 0,
+                valuesCleared: 0, recordsRenamed: 0
             },
             unresolvedLinks: [],
             errors: [],
@@ -5755,11 +5812,15 @@ class Plugin extends AppPlugin {
                 if (Array.isArray(config.page_field_ids)) config.page_field_ids.push(w.id);
                 continue;
             }
-            if (have.type === 'choice' && w.type === 'choice') {
+            if (have.type === 'choice') {
+                // Decided by the persisted field, not by this run's inference: a column that was a choice on the first
+                // import can come back as text (e.g. more distinct values), and its values must still find an option.
+                // The field is never retyped; only missing options are added.
+                const labels = w.type === 'choice' ? w.choices.map(c => c.label) : this._planChoiceLabels(ctx, def, w.id, []);
                 have.choices = have.choices || [];
                 const known = new Set(have.choices.map(c => String(c.label).toLowerCase()));
                 const used = new Set(have.choices.map(c => c.id));
-                const fresh = w.choices.filter(c => !known.has(c.label.toLowerCase())).map(c => c.label);
+                const fresh = labels.filter(label => !known.has(label.toLowerCase()));
                 have.choices.push(...this._planChoiceOptions(fresh, [], have.choices.length, used));
             }
             if (have.type === 'record' && !have.filter_colguid && w.filter_colguid) {
@@ -5784,15 +5845,23 @@ class Plugin extends AppPlugin {
         throw new Error(`record ${guid} not found after creation`);
     }
 
-    /** Same dedupe keys as executeImport(): source_path||title, plus title-only for records that have no path. */
+    /**
+     * Existing records of a collection, indexed for re-import:
+     *   byPath  source_path (trimmed, lowercased, as makeDedupKey() normalises it) -> record, for every record that has one;
+     *   byTitle title (trimmed, lowercased) -> record, only for records that have NO source_path (hand-made or older imports).
+     * A record that has a source_path is identified by it alone, so a changed title cannot create a duplicate.
+     * executeImport() (CSV / Obsidian / ...) keeps its own source_path||title key; only the engine uses this.
+     */
     async _planExistingRecords(collection) {
-        const byKey = new Map();
+        const norm = (text) => String(text || '').trim().toLowerCase();
+        const byPath = new Map();
+        const byTitle = new Map();
         for (const record of await collection.getAllRecords()) {
-            const pathValue = typeof record.text === 'function' ? (record.text('source_path') || record.text('path') || '') : '';
-            const key = this.makeDedupKey(pathValue, record.getName());
-            if (key.trim() !== '||') byKey.set(key, record);
+            const pathValue = norm(typeof record.text === 'function' ? (record.text('source_path') || record.text('path') || '') : '');
+            if (pathValue) byPath.set(pathValue, record);
+            else if (norm(record.getName())) byTitle.set(norm(record.getName()), record);
         }
-        return byKey;
+        return { byPath, byTitle, norm };
     }
 
     /** Deletes a record's body (children first). Never follows references into other records. */
@@ -5826,15 +5895,15 @@ class Plugin extends AppPlugin {
                 if (!existingByCollection.has(def.collection)) {
                     existingByCollection.set(def.collection, await this._planExistingRecords(col.api));
                 }
-                const existingByKey = existingByCollection.get(def.collection);
-                const pathKey = this.makeDedupKey(def.sourcePath, def.title);
-                let found = existingByKey.get(pathKey);
-                if (!found) {
+                const existing = existingByCollection.get(def.collection);
+                const pathKey = existing.norm(def.sourcePath);
+                const titleKey = existing.norm(def.title);
+                let found = pathKey ? existing.byPath.get(pathKey) : existing.byTitle.get(titleKey);
+                if (!found && pathKey) {
                     // Adopt a record that has the same title but no source_path yet, once only
-                    // (executeImport() keeps the fallback key, so same-titled files overwrite each other).
-                    const fallbackKey = this.makeDedupKey('', def.title);
-                    found = existingByKey.get(fallbackKey);
-                    if (found) existingByKey.delete(fallbackKey);
+                    // (a record that has a source_path is never taken by title).
+                    found = existing.byTitle.get(titleKey);
+                    if (found) existing.byTitle.delete(titleKey);
                 }
                 let record = found;
                 const isUpdate = !!found;
@@ -5846,6 +5915,10 @@ class Plugin extends AppPlugin {
                     continue;
                 }
 
+                // Everything an update needs to READ (current title, which declared fields hold a value) is read here,
+                // before this pass writes anything to the record: Thymer's reads right after a write are stale.
+                const before = isUpdate ? this._planReadUpdateState(ctx, col, def, record) : null;
+
                 if (!isUpdate) {
                     const guid = col.api.createRecord(def.title);
                     if (!guid) throw new Error('createRecord returned null');
@@ -5853,9 +5926,9 @@ class Plugin extends AppPlugin {
                     await this._planSleep(ctx, ctx.opts.settleMs ?? 300);
                 }
                 ctx.index.bind(def.key, record.guid);
-                existingByKey.set(pathKey, record);
+                if (pathKey) existing.byPath.set(pathKey, record);
+                else existing.byTitle.set(titleKey, record);
                 ctx.records.set(def.key, { def, record });
-
                 if (this.setFieldValue(record, 'source_path', def.sourcePath) === false && def.sourcePath) {
                     ctx.report.warnings.push({ code: 'property-not-set', message: 'source_path not set', record: def.key, field: 'source_path' });
                 }
@@ -5877,6 +5950,11 @@ class Plugin extends AppPlugin {
                     }
                 }
 
+                if (before) {
+                    this._planRenameIfChanged(ctx, def, record, before);
+                    this._planClearAbsentValues(ctx, def, record, before);
+                }
+
                 if (isUpdate) await this._planClearBody(record);
                 if (def.body) {
                     const ok = await record.insertFromMarkdown(this._planPrepareMarkdown(def.body), null, null);
@@ -5887,6 +5965,120 @@ class Plugin extends AppPlugin {
                 ctx.report.counts.recordsFailed++;
                 this._planError(ctx, 2, error, { record: def.key });
             }
+        }
+    }
+
+    // ---- clearing values that are gone from the source -----------------------
+
+    /** Ids that are never cleared, whatever a plan declares: the engine's own field and Thymer's built-in ones. */
+    static get _PLAN_PROTECTED_FIELDS() {
+        return new Set(['source_path', 'title', 'name', 'created_at', 'updated_at', 'created_by', 'updated_by', 'id', 'guid']);
+    }
+
+    /**
+     * The field ids that may be cleared on an updated record of one collection: the fields this plan DECLARES for it
+     * (def.fields, which is the source's truth, even if no record in this export has a value for one, e.g. a column
+     * that is now empty everywhere), that exist and are active and writable in the persisted collection, and are not a
+     * built-in or system field or source_path. Fields the plan does not declare (added by hand in Thymer, or declared
+     * only for another collection) are never in this set. Cached per collection.
+     */
+    _planClearableFields(ctx, entry) {
+        if (entry.clearable) return entry.clearable;
+        const persisted = new Map(((entry.api && entry.api.getConfiguration().fields) || []).map(f => [f.id, f]));
+        const protectedIds = Plugin._PLAN_PROTECTED_FIELDS;
+        entry.clearable = new Set((entry.def.fields || [])
+            .map(fd => fd.id || this.slugify(fd.label))
+            .filter(id => {
+                const have = persisted.get(id);
+                return id && !protectedIds.has(id) && have && have.active !== false && have.read_only !== true;
+            }));
+        return entry.clearable;
+    }
+
+    /**
+     * Reads, before the pass writes anything to an updated record, what the update needs to know:
+     *   title     the record's current name (for the rename check);
+     *   toClear   the clearable fields (see _planClearableFields) for which this plan gives the record no value (no
+     *             scalar value: undefined / null / '' / [], and for record fields no planned link) AND that hold a value now.
+     * A relation whose links are planned but cannot be resolved is left alone (the source still has a value).
+     * Thymer reads are stale right after a write, so nothing here is ever re-read after the writes that follow.
+     */
+    _planReadUpdateState(ctx, entry, def, record) {
+        if (!ctx.propertyLinkKeys) {
+            ctx.propertyLinkKeys = new Set((ctx.plan.links || []).filter(l => l.where === 'property').map(l => `${l.from}\u0000${l.field}`));
+        }
+        const present = (v) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.filter(x => x !== null && x !== undefined && x !== '').length === 0);
+        const toClear = [];
+        for (const fieldId of this._planClearableFields(ctx, entry)) {
+            if (present((def.values || {})[fieldId]) || ctx.propertyLinkKeys.has(`${def.key}\u0000${fieldId}`)) continue;
+            try {
+                const prop = record.prop(fieldId);
+                const stored = prop && (typeof prop.count === 'function' ? prop.count() : (typeof prop.values === 'function' ? prop.values().length : 0));
+                if (stored > 0) toClear.push(fieldId);
+            } catch (error) {
+                ctx.report.warnings.push({ code: 'property-not-cleared', message: `${fieldId} could not be read: ${error && error.message || error}`, record: def.key, field: fieldId });
+            }
+        }
+        return { title: record.getName(), toClear };
+    }
+
+    /**
+     * Clears the fields found by _planReadUpdateState(), so a cell or frontmatter key that was emptied or removed in a
+     * later export is emptied here too. One call per property (_planClearProperty), counted in
+     * report.counts.valuesCleared when it does not throw; a throw is a 'property-not-cleared' warning.
+     */
+    _planClearAbsentValues(ctx, def, record, before) {
+        for (const fieldId of before.toClear) {
+            try {
+                const prop = record.prop(fieldId);
+                if (!prop) continue;
+                this._planClearProperty(prop);
+                ctx.report.counts.valuesCleared++;
+            } catch (error) {
+                ctx.report.warnings.push({ code: 'property-not-cleared', message: `${fieldId} could not be cleared: ${error && error.message || error}`, record: def.key, field: fieldId });
+            }
+        }
+    }
+
+    /**
+     * Empties a property with exactly one call: set([]) for a multi-value property (set(array) replaces all values,
+     * types.d.ts:2995) and set(null) for a single-value one. Verified live: both clear every property type. No
+     * read-back and no fallback chain: reads right after a write are stale in Thymer, and a fallback driven by a stale
+     * read (removeValueAt / removeValue) writes a modified copy of the OLD values back. Throws if set() throws.
+     */
+    _planClearProperty(prop) {
+        const multi = typeof prop.isMultiValue === 'function' && prop.isMultiValue();
+        prop.set(multi ? [] : null);
+    }
+
+    /**
+     * A record matched by source_path whose title changed in the source is renamed through its built-in title property:
+     * record.prop('Title').set(name) (verified live; PluginRecord has no setName, types.d.ts:3305). 'Title' is tried
+     * first, then 'title'. Not verified with getName(), which is stale right after the write. Not done when the
+     * collection has a field of its own called "title" (the lookup could hit that instead).
+     */
+    _planRenameIfChanged(ctx, def, record, before) {
+        const wanted = String(def.title || '').trim();
+        if (!wanted || String(before.title).trim() === wanted) return;
+        const entry = ctx.collections.get(def.collection);
+        const ownTitleField = [...((entry && entry.def.fields) || []), ...((entry && entry.api && entry.api.getConfiguration().fields) || [])]
+            .some(f => [f.id, f.label].some(x => String(x || '').trim().toLowerCase() === 'title'));
+        try {
+            if (!ownTitleField) {
+                for (const name of ['Title', 'title']) {
+                    const prop = record.prop(name);
+                    if (!prop) continue;
+                    prop.set(def.title);
+                    ctx.report.counts.recordsRenamed++;
+                    return;
+                }
+            }
+            ctx.report.warnings.push({
+                code: 'title-not-renamed', record: def.key,
+                message: `"${before.title}" is now titled "${def.title}" in the source; the existing record was updated but ${ownTitleField ? 'the collection has its own "title" field' : 'has no title property to rename'}`
+            });
+        } catch (error) {
+            ctx.report.warnings.push({ code: 'title-not-renamed', record: def.key, message: `could not rename "${before.title}" to "${def.title}": ${error && error.message || error}` });
         }
     }
 
