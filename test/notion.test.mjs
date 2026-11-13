@@ -24,7 +24,7 @@ const ID = {
 const parsed = await plugin.parseNotionExport(dirHandle(FIXTURE));
 const rec = (title) => parsed.records.find(r => r.title === title);
 const col = (name) => parsed.collections.find(c => c.name === name);
-const fieldSummary = (c) => c.fields.map(f => [f.id, f.type, f.many ? 'many' : '', f.target ? f.target.replace(/^notion-db:/, '').slice(0, 4) : ''].filter(Boolean).join(':'));
+const fieldSummary = (c) => c.fields.map(f => [f.id, f.type, f.many ? 'many' : '', f.target ? f.target.replace(/^notion-db:/, '').slice(0, 4) : '', f.clearOnly ? 'clear-only' : ''].filter(Boolean).join(':'));
 
 /** A pickFolder() "filelist" result for the fixture, as the webkitdirectory fallback produces it. */
 function fixtureFileList() {
@@ -57,23 +57,24 @@ test('column types: BOM stripped, multi-select -> choice many, dates, Yes/No cho
         'cuisine:choice', 'tags:choice:many', 'made_on:datetime', 'rating:number', 'source:url',
         'ingredients:record:many:ce42', 'ingredients_text:text', 'pairs_with:choice', 'vegetarian:choice'
     ]);
-    assert.deepEqual(fieldSummary(col('Ingredients')), ['category:choice', 'used_in:record:many:628e']);
+    // used_in_text: nothing is left over in this export, so the companion is only declared to clear an earlier import's text
+    assert.deepEqual(fieldSummary(col('Ingredients')), ['category:choice', 'used_in:record:many:628e', 'used_in_text:text:clear-only']);
     for (const c of parsed.collections) for (const f of c.fields) assert.ok(!/﻿/.test(f.label), 'no BOM in a field label');
     assert.equal(col('Recipes').fields[0].label, 'Cuisine', 'title column (Name) is the record title, not a field');
     // vegetarian exists only in Recipes_all.csv, and comes after the view's columns
     assert.ok(parsed.parseReport.databases.find(d => d.name === 'Recipes').csv.columnsOnlyInAll.includes('Vegetarian'));
 });
 
-test('values: ISO dates, datetime with time, date range keeps both ends, multi-select arrays, numbers', () => {
-    assert.equal(rec('Pancakes').values.made_on, '2024-03-03');
-    assert.equal(rec('Waffles').values.made_on, '2024-04-01T15:30');
-    assert.equal(rec('Untitled').values.made_on, '2024-05-09/2024-05-10');
+test('values keep the source spelling (dates, multi-select, numbers); the engine converts them by the persisted field', () => {
+    assert.equal(rec('Pancakes').values.made_on, 'March 3, 2024');
+    assert.equal(rec('Waffles').values.made_on, 'April 1, 2024 3:30 PM');
+    assert.equal(rec('Untitled').values.made_on, 'May 9, 2024 → May 10, 2024');
     const recipes = parsed.parseReport.databases.find(d => d.name === 'Recipes');
     assert.equal(recipes.dateRangesKept, 1);
     assert.equal(recipes.dateRangesTruncated, 0);
-    assert.deepEqual(rec('Pancakes').values.tags, ['Breakfast', 'Sweet']);
-    assert.deepEqual(rec('Waffles').values.tags, ['Breakfast']);
-    assert.equal(rec('Pancakes').values.rating, 4);
+    assert.equal(rec('Pancakes').values.tags, 'Breakfast, Sweet');
+    assert.equal(rec('Waffles').values.tags, 'Breakfast');
+    assert.equal(rec('Pancakes').values.rating, '4', 'a string: only a persisted number field turns it into a number');
     assert.equal(rec('Pancakes').values.vegetarian, 'Yes');
     assert.equal(rec('Soup').values.vegetarian, 'No');
     assert.equal(rec('Ratatouille').values.made_on, undefined, 'empty cells are not set');
@@ -95,7 +96,7 @@ test('rows and pages are paired by title; leftovers are reported, not dropped', 
 
     assert.equal(rec('Tea').body, '');
     assert.match(rec('Tea').sourcePath, /_ExportBlock-[^/]+\/Recipes\/Tea$/);
-    assert.equal(rec('Tea').values.tags.length, 2);
+    assert.equal(rec('Tea').values.tags, 'Breakfast, Drinks');
 
     // the page with no CSV row is a record in the same collection; with nothing to strip against, its text is kept whole
     assert.equal(rec('Draft Smoothie').collection, col('Recipes').key);
@@ -220,7 +221,7 @@ test('plan snapshot: the key parts of the ImportPlan', () => {
     };
     assert.deepEqual(slim, {
         collections: [
-            { name: 'Ingredients', icon: 'ti-database', fields: ['category:choice', 'used_in:record:many:628e'] },
+            { name: 'Ingredients', icon: 'ti-database', fields: ['category:choice', 'used_in:record:many:628e', 'used_in_text:text:clear-only'] },
             { name: 'Recipes', icon: 'ti-database', fields: fieldSummary(col('Recipes')) },
             { name: 'Notion Pages', icon: 'ti-file-text', fields: [] }
         ],

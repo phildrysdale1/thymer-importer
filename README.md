@@ -94,7 +94,7 @@ Alice,30,Active,2024-01-15
 - Skipped: `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` at the vault root, dot-folders (`.git`, `.claude`, …) and Tolaria UI state (`_organized`, `_favorite`, `_icon`, `visible`, `color`, …)
 - Links to notes that don't exist stay as `[[text]]`
 
-**Import report:** collections, records, links and images created, updated or failed; types without notes; untyped notes; skipped files; links left as text; errors.
+**Import report:** collections, records, links and images created, updated or failed; types without notes; untyped notes; skipped files; links left as text; errors; and warnings grouped by kind (the status says "Finished with warnings").
 
 ### Import Notion Export
 
@@ -109,9 +109,9 @@ Alice,30,Active,2024-01-15
 - Standalone pages → a **Notion Pages** collection
 - Images in pages → uploaded **images**; `<aside>` callouts → quotes; the repeated property list at the top of row pages is dropped
 - Left as text and listed in the report: relations to pages outside the export, and columns that only name rows of another database
-- Skipped: empty columns and inline `data:` images
+- Empty columns create no field (on a re-import they clear what an earlier import stored in the same column); inline `data:` images are skipped
 
-**Import report:** counts, links left as text, relations to pages outside the export, missing images, rows without a page and pages without a row, and errors.
+**Import report:** counts, links left as text, relations to pages outside the export, missing images, rows without a page and pages without a row, errors, and warnings grouped by kind (the status says "Finished with warnings").
 
 ### If a collection already exists (Tolaria and Notion)
 

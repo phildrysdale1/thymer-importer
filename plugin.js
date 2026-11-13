@@ -6,6 +6,7 @@ const VERSION = 'v0.0.13';
  * v0.0.13 - New sources Tolaria (vault with typed notes) and Notion export (Markdown & CSV, one collection per database) on a shared ImportPlan engine (record references, link index, images, date-only values via DateTime.dateOnly); they use an <input webkitdirectory> folder picker (works in Thymer Desktop); a same-named existing collection that is not a previous import asks first: separate (prefixed) collections or merge; Node test harness (npm test)
  * v0.0.13 (review fixes) - Notion: rows folder named with the database id is claimed, page-less rows with the same title keep distinct source paths (#2, #3); Tolaria: collision-free field ids (cost, cost_2); re-import matches by source_path alone (a changed title renames the record via its Title property, no duplicate), persisted choice fields gain new options whatever the inference says, and values removed from the source are cleared on update (counted in the report)
  * v0.0.13 (review fixes, round 2) - on re-import the persisted collection is authoritative: fields are matched to existing ones by label (Tolaria / Notion field ids no longer shift when a colliding key appears later), every value is written according to the persisted field's type, many-ness and options (dates via DateTime.dateOnly / dateAndTime, links as source text in url / text fields, multi-choice tokens), a Notion page renamed in the export is matched by its page id, and existing: 'skip' also skips the link and asset passes
+ * v0.0.13 (review fixes, round 3) - re-import: field labels are matched as written, then ignoring case, and ignoring space / _ / - only when that is unambiguous on both sides (Home-URL and Home_URL stay two fields); the plan keeps the source spelling of numbers, dates and choices and the persisted field converts them (000123 and 1.50 survive a column that is text in Thymer); a Notion column that is empty everywhere (and a Tolaria key that is blank in every note) clears what an earlier import stored, without creating a field; the Tolaria and Notion reports list warnings by code and the status says "Finished with warnings". Self-review: columns of zero-padded or 16+ digit numbers and impossible dates stay text, read-only / archived fields are never matched or written, look-alike Tolaria keys keep separate labels, duplicate source paths are reported
  * v0.0.12 - Create New Collection: frontmatter keys tag / tags get property type hashtag (many: true when values are YAML lists)
  * v0.0.11 - Markdown folder picker: use pickFolder() like journal import (showDirectoryPicker without startIn + webkitdirectory fallback for Safari/macOS); scanVaultFiles supports file-list result
  * v0.0.10 - Optional plugin.json custom.markdown_import_hashtag_escape (default true): set false to disable v0.0.9 hashtag-like token escaping
@@ -4181,23 +4182,40 @@ class Plugin extends AppPlugin {
         // key order, not in the order notes happen to be read, so the same vault always maps to the same ids and a
         // re-import finds the fields it created.
         const keysWithValues = new Set();
+        // Keys that are present but empty (`due:` / `due: null` / `[]`): the author blanked them, which is not the same as
+        // never having them. A key that is blank in every note of a collection becomes a clear-only field (below).
+        const blankKeys = new Map();   // lowercased key -> Set(spellings)
+        const blankInNote = new Map(); // note -> Set(lowercased keys)
+        const hasValue = (raw) => (Array.isArray(raw) ? raw : [raw]).some(v => v !== null && v !== undefined && String(v).trim() !== '');
         for (const note of notes) {
+            const blank = new Set();
+            blankInNote.set(note, blank);
             for (const [key, raw] of Object.entries(note.frontmatter)) {
                 const lower = key.trim().toLowerCase();
                 if (lower === 'type' || lower.startsWith('_') || DROP.has(lower)) continue;
-                if ((Array.isArray(raw) ? raw : [raw]).some(v => v !== null && v !== undefined && String(v).trim() !== '')) keysWithValues.add(lower);
+                if (hasValue(raw)) {
+                    keysWithValues.add(lower);
+                } else {
+                    blank.add(lower);
+                    if (!blankKeys.has(lower)) blankKeys.set(lower, new Set());
+                    blankKeys.get(lower).add(key.trim());
+                }
             }
         }
         const takenIds = new Set();
         let unnamedKeys = 0;
-        for (const lower of Array.from(keysWithValues).sort()) {
+        const allocateId = (lower) => {
             let base = this.slugify(lower) || `field_${++unnamedKeys}`;
             if (base === 'source_path') base = 'source_path_value';
             let id = base;
             for (let n = 2; takenIds.has(id); n++) id = `${base}_${n}`;
             takenIds.add(id);
             fieldIds.set(lower, id);
-        }
+        };
+        for (const lower of Array.from(keysWithValues).sort()) allocateId(lower);
+        // keys that are only ever blank get their ids after every key that has a value, so the ids of the real fields are
+        // the same as they would be without them
+        for (const lower of Array.from(blankKeys.keys()).filter(k => !keysWithValues.has(k)).sort()) allocateId(lower);
         for (const note of notes) {
             const mine = new Map();
             noteProps.set(note, mine);
@@ -4213,19 +4231,39 @@ class Plugin extends AppPlugin {
                 prop.variants.add(key.trim());
                 prop.items.push(...items);
                 if (Array.isArray(raw)) prop.list = true;
-                if (!mine.has(id)) mine.set(id, items);
+                if (!mine.has(id)) {
+                    mine.set(id, items);
+                } else {
+                    // two spellings of one key in one note ("Status" and "status") share a field, which holds one value
+                    report.warnings.push(`${note.file.path}: the key "${key.trim()}" is a second spelling of a key the note already has; only the first value is kept`);
+                }
             }
         }
+        const labelOf = (variants) => {
+            const list = Array.from(variants);
+            const lower = list[0].toLowerCase();
+            const label = list.find(v => /[A-Z]/.test(v) && !v.includes('_')) || (lower === 'url' ? 'URL' : this._tolariaTitleCase(lower));
+            return label.trim() === label.trim().toLowerCase() ? this._tolariaTitleCase(label) : label.trim();
+        };
+        // One label per field id. Two DIFFERENT keys can read alike ("cost_x" and "cost x" are both "Cost X"): a label is what a
+        // re-import matches a field by, so identical labels would let one key take over the other's field when ids shift.
+        // Such keys keep their own spelling as the label instead, so they stay two fields (ordinary keys are unaffected).
+        const variantsOf = new Map(Array.from(props.values()).map(prop => [prop.id, prop.variants]));
+        for (const [lower, spellings] of blankKeys) if (!keysWithValues.has(lower)) variantsOf.set(fieldIds.get(lower), spellings);
+        const labelOfId = new Map(Array.from(variantsOf, ([id, variants]) => [id, labelOf(variants)]));
+        const sameLabel = new Map();
+        for (const [id, label] of labelOfId) sameLabel.set(label.toLowerCase(), [...(sameLabel.get(label.toLowerCase()) || []), id]);
+        for (const ids of sameLabel.values()) {
+            if (ids.length > 1) for (const id of ids) labelOfId.set(id, Array.from(variantsOf.get(id)).sort()[0].trim());
+        }
         for (const prop of props.values()) {
-            const lower = Array.from(prop.variants)[0].toLowerCase();
             if (prop.variants.size > 1) report.mergedKeys[prop.id] = Array.from(prop.variants).sort();
-            const label = Array.from(prop.variants).find(v => /[A-Z]/.test(v) && !v.includes('_')) || (lower === 'url' ? 'URL' : this._tolariaTitleCase(lower));
-            prop.label = label.trim() === label.trim().toLowerCase() ? this._tolariaTitleCase(label) : label.trim();
+            prop.label = labelOfId.get(prop.id);
             if (RELATION_KEYS.has(prop.id) || prop.items.every(v => this._tolariaParseWikilink(v))) { prop.type = 'record'; prop.many = true; }
             else if (prop.id === 'status' || prop.id === 'kind') { prop.type = 'choice'; prop.many = prop.list; }
             else if (prop.id === 'url') { prop.type = 'url'; prop.many = prop.list; }
-            else if (!prop.list && prop.items.every(v => /^-?\d+(\.\d+)?$/.test(v))) { prop.type = 'number'; prop.many = false; }
-            else if (!prop.list && prop.items.every(v => /^\d{4}-\d{2}-\d{2}$/.test(v))) { prop.type = 'datetime'; prop.many = false; }
+            else if (!prop.list && prop.items.every(v => this._looksNumeric(v))) { prop.type = 'number'; prop.many = false; }
+            else if (!prop.list && prop.items.every(v => /^\d{4}-\d{2}-\d{2}$/.test(v) && this._planParseDatePart(v))) { prop.type = 'datetime'; prop.many = false; }
             else { prop.type = 'text'; prop.many = prop.list; }
         }
 
@@ -4249,8 +4287,26 @@ class Plugin extends AppPlugin {
                     col.fields.push(omitUndefined({ id, label: prop.label, type: prop.type, many: prop.many || undefined }));
                 }
                 if (prop.type === 'record') continue;
-                record.values[id] = prop.type === 'number' ? Number(items[0]) : (prop.many ? items : items[0]);
+                // The value stays the source's text, whatever type this vault's key looks like ('007' stays '007'): the engine
+                // converts it by the PERSISTED field when it writes (a number field takes a number there, a text field the text)
+                record.values[id] = prop.many ? items : items[0];
             }
+        }
+        // A key that is present but empty in every note of a collection that has it: the author blanked it. It is declared
+        // as a clear-only field so an earlier import's values for it are cleared on a re-import; it creates no field.
+        // A key that was REMOVED from every note of the collection is not declared (see readme-changelog.md): a note that
+        // lacks a key says nothing a column header does, so the old values stay.
+        const clearOnly = new Map();   // collection key -> Map(field id -> label)
+        for (const note of notes) {
+            for (const lower of blankInNote.get(note)) {
+                const id = fieldIds.get(lower);
+                if (colByKey.get(note.def.key).fields.some(f => f.id === id)) continue;
+                if (!clearOnly.has(note.def.key)) clearOnly.set(note.def.key, new Map());
+                clearOnly.get(note.def.key).set(id, labelOfId.get(id));
+            }
+        }
+        for (const [key, ids] of clearOnly) {
+            for (const [id, label] of ids) colByKey.get(key).fields.push({ id, label, type: 'text', clearOnly: true });
         }
         // Relations need a LinkIndex over the finished records so `target` can be decided.
         const index = LinkIndex.fromPlan(plan);
@@ -4382,11 +4438,38 @@ class Plugin extends AppPlugin {
         }
     }
 
+    /**
+     * Every warning of a run, for the Tolaria and Notion reports, grouped by code:
+     *   [{ code, count, examples: [string], more }]  most frequent first (ties keep the order they first appeared in).
+     * The engine's warnings (report.warnings: { code, message, record?, collection?, field? }) group by their own code; what the
+     * parser noted while reading the source (plan.parseReport.warnings, plain strings) is one group with the code 'reading'.
+     * An example is "<record title>: <message>". `total` is the number of warnings, which decides "Finished with warnings".
+     */
+    _importWarnings(plan, report, { maxExamples = 3 } = {}) {
+        const titles = new Map(((plan && plan.records) || []).map(r => [r.key, r.title]));
+        const groups = new Map();
+        const add = (code, text) => {
+            if (!groups.has(code)) groups.set(code, { code, count: 0, examples: [], more: 0 });
+            const g = groups.get(code);
+            g.count++;
+            if (g.examples.length < maxExamples) g.examples.push(text); else g.more++;
+        };
+        for (const w of (report && report.warnings) || []) {
+            if (!w || typeof w !== 'object') { add('warning', String(w)); continue; }
+            const where = w.record ? (titles.get(w.record) || w.record) : (w.collection || '');
+            add(w.code || 'warning', `${where ? `${where}: ` : ''}${w.message || w.code || 'warning'}`);
+        }
+        for (const text of (plan && plan.parseReport && plan.parseReport.warnings) || []) add('reading', String(text));
+        const list = Array.from(groups.values()).sort((a, b) => b.count - a.count);
+        return { groups: list, total: list.reduce((n, g) => n + g.count, 0) };
+    }
+
     renderTolariaReport(statusDiv, plan, report) {
         const c = report.counts;
         const p = plan.parseReport || {};
         const failed = report.errors.length > 0 || c.recordsFailed > 0;
-        this.showStatus(statusDiv, '', failed ? 'warning' : 'success');
+        const warned = this._importWarnings(plan, report);
+        this.showStatus(statusDiv, '', failed || warned.total ? 'warning' : 'success');
         statusDiv.style.textAlign = 'left';
         const add = (tag, text, style = '') => {
             const el = document.createElement(tag);
@@ -4402,7 +4485,7 @@ class Plugin extends AppPlugin {
             if (items.length > limit) { const li = document.createElement('li'); li.textContent = `...and ${items.length - limit} more`; ul.appendChild(li); }
             statusDiv.appendChild(ul);
         };
-        add('div', failed ? 'Import finished with problems' : 'Import complete', 'font-weight: 600;');
+        add('div', failed ? 'Finished with problems' : (warned.total ? 'Finished with warnings' : 'Import complete'), 'font-weight: 600;');
         add('div', `Collections: ${c.collectionsCreated} created, ${c.collectionsUpdated} updated`);
         add('div', `Records: ${c.recordsCreated} created, ${c.recordsUpdated} updated${c.recordsRenamed ? ` (${c.recordsRenamed} renamed)` : ''}${c.recordsFailed ? `, ${c.recordsFailed} failed` : ''}`);
         if (c.valuesCleared) add('div', `Values cleared (gone from the source): ${c.valuesCleared}`);
@@ -4423,6 +4506,13 @@ class Plugin extends AppPlugin {
         if (report.errors.length) {
             add('div', 'Errors:', 'margin-top: 8px; font-weight: 600; font-size: 12px;');
             list(report.errors.map(e => `${e.record || e.collection || e.asset || `pass ${e.pass}`}: ${e.message}`));
+        }
+        if (warned.total) {
+            add('div', `Warnings (${warned.total}):`, 'margin-top: 8px; font-weight: 600; font-size: 12px;');
+            for (const g of warned.groups) {
+                add('div', `${g.code} (${g.count})`, 'margin-top: 4px; font-size: 12px;');
+                list([...g.examples, ...(g.more ? [`...and ${g.more} more`] : [])]);
+            }
         }
     }
 
@@ -4701,12 +4791,15 @@ class Plugin extends AppPlugin {
             if (ap) { hh = hh % 12 + (/^p/i.test(ap) ? 12 : 0); }
             return `T${pad(hh)}:${mi}`;
         };
+        // only a real calendar date and time counts ("February 30, 2026" is not a date): the engine would refuse to store it,
+        // so a column of such cells is text, not a date column that drops them
+        const real = (iso) => (this._planParseDatePart(iso) ? iso : null);
         let m = s.match(/^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})(?:\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?$/);
-        if (m && monthOf(m[1])) return `${m[3]}-${pad(monthOf(m[1]))}-${pad(m[2])}${timePart(m[4], m[5], m[6])}`;
+        if (m && monthOf(m[1])) return real(`${m[3]}-${pad(monthOf(m[1]))}-${pad(m[2])}${timePart(m[4], m[5], m[6])}`);
         m = s.match(/^(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})(?:\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?$/);
-        if (m && monthOf(m[2])) return `${m[3]}-${pad(monthOf(m[2]))}-${pad(m[1])}${timePart(m[4], m[5], m[6])}`;
+        if (m && monthOf(m[2])) return real(`${m[3]}-${pad(monthOf(m[2]))}-${pad(m[1])}${timePart(m[4], m[5], m[6])}`);
         m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?$/);
-        if (m && +m[2] >= 1 && +m[2] <= 12 && +m[3] >= 1 && +m[3] <= 31) return `${m[1]}-${pad(m[2])}-${pad(m[3])}${timePart(m[4], m[5], m[6])}`;
+        if (m && +m[2] >= 1 && +m[2] <= 12 && +m[3] >= 1 && +m[3] <= 31) return real(`${m[1]}-${pad(m[2])}-${pad(m[3])}${timePart(m[4], m[5], m[6])}`);
         return null;
     }
 
@@ -4741,7 +4834,29 @@ class Plugin extends AppPlugin {
         return String(value).split(/,\s+/).map(t => t.trim()).filter(Boolean);
     }
 
-    /** Works out each column's Thymer type. Returns [{ header, type, many?, target?, ... }]; empty columns are omitted. */
+    /**
+     * Whether a number written as text keeps all of its digits as a number: at most 15 significant digits (a double keeps
+     * 15 exactly; an id or phone number of 16+ digits would silently round).
+     */
+    _digitsFit(text) {
+        return String(text).replace(/^[+-]/, '').replace('.', '').replace(/^0+(?=\d)/, '').length <= 15;
+    }
+
+    /**
+     * Whether a source value is a number and nothing else, for deciding that a column / key IS a number: plain digits
+     * with an optional fraction, no leading zero ("007" and "000123" are codes, not numbers) and no more digits than a
+     * number keeps exactly. A column that fails this stays text, so nothing is rewritten on the way in.
+     */
+    _looksNumeric(text) {
+        const t = String(text).trim();
+        return /^-?\d+(\.\d+)?$/.test(t) && !/^-?0\d/.test(t) && this._digitsFit(t);
+    }
+
+    /**
+     * Works out each column's Thymer type. Returns [{ header, type, many?, target?, ... }]. A column whose cells are all
+     * empty is returned as { clearOnly: true }: its header is still in the CSV, so on a re-import the values an earlier
+     * import stored for it are gone on purpose (the engine clears them), but it is not a field to create.
+     */
     _notionAnalyzeColumns(db, ctx) {
         const cfg = ctx.cfg;
         const out = [];
@@ -4749,7 +4864,7 @@ class Plugin extends AppPlugin {
             const cells = db.rows.map(r => r.cells[header] || '');
             const values = cells.filter(Boolean);
             const col = { header, values: values.length };
-            if (values.length === 0) { db.diag.emptyColumns.push(header); continue; }
+            if (values.length === 0) { db.diag.emptyColumns.push(header); out.push({ ...col, type: 'text', clearOnly: true }); continue; }
 
             // relation: cells carrying Notion page ids
             const parsed = cells.map(c => (c ? this._notionParseRelationCell(c) : { ids: [], text: [] }));
@@ -4788,7 +4903,7 @@ class Plugin extends AppPlugin {
                 out.push({ ...col, type: 'datetime' });
                 continue;
             }
-            if (values.every(v => this.coerceNumber(v) !== null)) { out.push({ ...col, type: 'number' }); continue; }
+            if (values.every(v => this._looksNumeric(v))) { out.push({ ...col, type: 'number' }); continue; }
 
             const tokens = values.map(v => this._notionSelectTokens(v));
             const flat = tokens.flat();
@@ -5051,7 +5166,7 @@ class Plugin extends AppPlugin {
                 return id;
             };
             const fields = [];
-            for (const col of columns) {
+            for (const col of columns.filter(c => !c.clearOnly)) {
                 col.id = fieldId(col.header);
                 fields.push(omitUndefined({ id: col.id, label: col.header, type: col.type, many: col.many ? true : undefined, target: col.target }));
                 db.diag.columns.push(omitUndefined({ header: col.header, type: col.type, many: col.many || undefined, target: col.target, values: col.values }));
@@ -5071,7 +5186,7 @@ class Plugin extends AppPlugin {
                 if (!rec.row) continue;
                 for (const col of columns) {
                     const cell = rec.row.cells[col.header] || '';
-                    if (!cell) continue;
+                    if (!cell || col.clearOnly) continue;
                     if (col.type === 'record') {
                         const { ids, text } = this._notionParseRelationCell(cell);
                         const leftover = [];
@@ -5101,17 +5216,27 @@ class Plugin extends AppPlugin {
                             const leftText = text.filter(t => leftover.includes(t));
                             if (leftText.length) col.leftoverCells = (col.leftoverCells || []).concat(leftText.join(', '));
                         }
-                    } else if (col.type === 'datetime') {
-                        rec.values[col.id] = this._notionDateCell(cell).value;
-                    } else if (col.type === 'number') {
-                        rec.values[col.id] = this.coerceNumber(cell);
-                    } else if (col.type === 'choice') {
-                        const tokens = Array.from(new Set(this._notionSelectTokens(cell)));
-                        rec.values[col.id] = col.many ? tokens : tokens[0];
                     } else {
+                        // Every other column keeps the cell exactly as the source spells it (number, date, choice, url and
+                        // text alike). What a value becomes is decided by the PERSISTED field when it is written, not by what
+                        // this export's columns look like: a column first imported as text must not lose the zeros of '000123',
+                        // the spelling of 'March 1, 2026' or the separators of 'Red,  Blue' because a later export reads as a
+                        // number / date / choice. The engine converts (applyImportPlan, _planWriteField).
                         rec.values[col.id] = cell;
                     }
                 }
+            }
+
+            // Clear-only fields are declared last, so the ids of the real columns and companions are what they always were.
+            for (const col of columns.filter(c => c.clearOnly)) {
+                col.id = fieldId(col.header);
+                fields.push({ id: col.id, label: col.header, type: 'text', clearOnly: true });
+            }
+            // A relation column's "(text)" companion holds what could not be linked. If nothing is left over in this export,
+            // the companion is still declared (clear-only) so text an earlier import left in it is cleared on a re-import.
+            // (A column that is empty everywhere may have been a relation before: its companion is cleared the same way.)
+            for (const col of columns.filter(c => (c.type === 'record' || c.clearOnly) && !companions.has(c.header))) {
+                fields.push({ id: fieldId(`${col.header} (text)`), label: `${col.header} (text)`, type: 'text', clearOnly: true });
             }
 
             // report: relation columns and link-by-title candidates
@@ -5203,7 +5328,7 @@ class Plugin extends AppPlugin {
         section('Rows without a page that share a title (kept as separate records; the later ones are matched on re-import by their order in the CSV, source paths …#2, …#3)', 'warning',
             dbs.flatMap(d => (d.duplicateRowsWithoutPage || []).map(x => `${d.name}: "${x.title}" × ${x.count} (${x.paths.map(p => p.split('/').pop()).join(', ')})`)));
         section('Pages without a CSV row (imported as records)', 'info', dbs.flatMap(d => d.pagesWithoutRow.map(p => `${d.name}: ${p.title}`)));
-        section('Empty columns (not imported)', 'info', dbs.flatMap(d => d.emptyColumns.map(h => `${d.name}.${h}`)));
+        section('Empty columns (no field is created; on a re-import they clear what an earlier import stored)', 'info', dbs.flatMap(d => d.emptyColumns.map(h => `${d.name}.${h}`)));
         section('Missing images/files (left as text)', 'warning', ((pr.assets && pr.assets.missing) || []).map(x => `${x.from}: ${x.path}`));
         const notes = [];
         if (pr.html && pr.html.asides) notes.push(`${pr.html.asides} <aside> callouts converted to blockquotes`);
@@ -5213,13 +5338,18 @@ class Plugin extends AppPlugin {
         if (kept) notes.push(`${kept} date ranges imported as ranges`);
         const ranges = dbs.reduce((n, d) => n + d.dateRangesTruncated, 0);
         if (ranges) notes.push(`${ranges} date ranges imported as their start date`);
-        section('Notes', 'info', [...notes, ...(pr.warnings || [])]);
+        section('Notes', 'info', notes);
         section('Errors', 'error', ((report && report.errors) || []).map(e => `pass ${e.pass}${e.record ? ` / ${e.record}` : ''}: ${e.message}`));
-        section('Warnings', 'warning', ((report && report.warnings) || []).map(w => w.message || String(w)));
+        // warnings: one section per code, with the count and the first few examples (the engine's and the parser's)
+        const warned = this._importWarnings(plan, report);
+        for (const g of warned.groups) {
+            sections.push({ title: `Warnings: ${g.code} (${g.count})`, tone: 'warning', items: [...g.examples, ...(g.more ? [`…and ${g.more} more`] : [])] });
+        }
 
         const failed = (c.recordsFailed || 0) + ((report && report.errors) || []).length;
         return {
-            headline: `${plan.collections.length} collection(s), ${plan.records.length} record(s)${failed ? `, ${failed} problem(s)` : ''}`,
+            headline: `${plan.collections.length} collection(s), ${plan.records.length} record(s)${failed ? `, ${failed} problem(s)` : ''}${warned.total ? `, ${warned.total} warning(s)` : ''}`,
+            problems: failed, warnings: warned.total,
             counts, sections
         };
     }
@@ -5271,7 +5401,7 @@ class Plugin extends AppPlugin {
                 onProgress: ({ message, done, total }) => this.showStatus(statusDiv, total ? `${message} (${done}/${total})` : message, 'info')
             });
             const summary = this._notionSummarize(plan, report);
-            this.showStatus(statusDiv, `${report.errors.length ? 'Finished with problems' : 'Complete!'} ${summary.headline}`, report.errors.length ? 'warning' : 'success');
+            this.showStatus(statusDiv, `${report.errors.length ? 'Finished with problems' : (summary.warnings ? 'Finished with warnings' : 'Complete!')} ${summary.headline}`, report.errors.length || summary.warnings ? 'warning' : 'success');
             reportDiv.innerHTML = this._notionReportHtml(summary, this.getThemeColors());
             cancelBtn.textContent = 'Close';
         } catch (error) {
@@ -5482,7 +5612,10 @@ class Plugin extends AppPlugin {
     //       fields: [{ id, label, type: 'text'|'number'|'choice'|'datetime'|'url'|'record'|...,
     //                  many?, icon?, choices?: [label | { id?, label, color? }],
     //                  target?: <collection key>   // type 'record': becomes filter_colguid
-    //                  numberFormat? }]
+    //                  numberFormat?,
+    //                  clearOnly?: true }]         // declared so that an EXISTING field of the same label can be cleared
+    //                                              // (a source column that is empty everywhere); never creates a field
+    //                                              // and is dropped when no persisted field has its label
     //     }],
     //     records: [{
     //       key,                 // stable source key (unique in the plan)
@@ -5490,8 +5623,12 @@ class Plugin extends AppPlugin {
     //       title, sourcePath,   // sourcePath is stored in the source_path field and drives dedupe
     //       aliases?: [{ kind, value }],   // extra LinkIndex aliases (kind: key|path|notion_id|slug|title)
     //       values: { <fieldId>: scalar | scalar[] },   // NOT record-type fields (use links)
-    //                            // 'datetime' fields: 'YYYY-MM-DD' (date only), 'YYYY-MM-DDTHH:MM[:SS]' (local time),
-    //                            // or 'A/B' (a range; A and B each in one of those forms)
+    //                            // Values are the SOURCE spelling (a number column's '000123' stays a string). The field's type
+    //                            // in this run's plan is only a guess: on an existing collection the PERSISTED field decides
+    //                            // what a value becomes (see "writing values, by the PERSISTED field"), so a number is converted
+    //                            // there and nowhere earlier. 'datetime' fields take 'YYYY-MM-DD' (date only),
+    //                            // 'YYYY-MM-DDTHH:MM[:SS]' (local time), 'A/B' (a range; A and B each in one of those forms),
+    //                            // or a date as the Notion export spells it (see _planDateOf)
     //       body: markdown       // may contain ⟦link:Lx⟧ / ⟦asset:Ax⟧ placeholders
     //     }],
     //     links: [{
@@ -5562,9 +5699,18 @@ class Plugin extends AppPlugin {
         }
 
         const records = new Map();
+        const paths = new Map();   // collection key + normalised source path -> first record key
         for (const r of plan.records || []) {
             if (records.has(r.key)) add('duplicate-record', `duplicate record key ${r.key}`, { record: r.key });
             records.set(r.key, r);
+            // source_path is how a re-import finds a record, compared trimmed and case-folded, so two records that differ
+            // only by case would be one record: the second overwrites the first
+            const pathKey = `${r.collection}\u0000${String(r.sourcePath || '').trim().toLowerCase()}`;
+            if (r.sourcePath && paths.has(pathKey)) {
+                add('duplicate-source-path', `records ${paths.get(pathKey)} and ${r.key} have the same source_path "${r.sourcePath}" (compared trimmed and ignoring case): the second overwrites the first`, { record: r.key });
+            } else if (r.sourcePath) {
+                paths.set(pathKey, r.key);
+            }
             const col = collections.get(r.collection);
             if (!col) { add('unknown-collection', `record ${r.key} has unknown collection ${r.collection}`, { record: r.key }); continue; }
             const fieldIds = new Set((col.fields || []).map(f => f.id || this.slugify(f.label)));
@@ -5755,7 +5901,7 @@ class Plugin extends AppPlugin {
         for (const f of fields || []) {
             if (!f || !f.id) continue;
             schema.set(f.id, {
-                id: f.id, label: f.label, type: f.type || 'text', many: f.many === true,
+                id: f.id, label: f.label, type: f.type || 'text', many: f.many === true, active: f.active !== false, readOnly: f.read_only === true,
                 choices: (f.choices || []).filter(c => c && c.active !== false).map(c => ({ id: c.id, label: String(c.label) }))
             });
         }
@@ -5766,43 +5912,76 @@ class Plugin extends AppPlugin {
      * Matches the plan's fields for an EXISTING collection to its persisted fields, and gives every plan field the id
      * of the persisted field it stands for. The label is the identity (an id is only a slug of it, and slugs are lossy
      * and depend on what else is in the export: "cost ($)" / "cost (%)" are both "cost", so which of them gets `cost`
-     * and which `cost_2` shifts when a colliding column first shows up in a later export):
-     *   1. a persisted field with the same id and the same label (compared case-insensitively, ignoring runs of
-     *      space / _ / -) is that field;
-     *   2. otherwise a still unmatched persisted field with the same label;
-     *   3. a plan field with no persisted counterpart is new: it keeps its id when nothing in the collection uses it,
+     * and which `cost_2` shifts when a colliding column first shows up in a later export). A label is compared
+     * strictly first and loosely only when the loose match cannot be a different column:
+     *   1. a persisted field with the same id and the same label as written is that field;
+     *   2. otherwise a still unmatched persisted field with the same label as written, when exactly one unmatched plan
+     *      field and one unclaimed persisted field have it (a tie is never broken by position);
+     *   3. and 4. the same two steps comparing labels case-insensitively (so "status" is the field labelled "status"
+     *      even when a field labelled "Status" also exists, and "Status" / "status" still merge when there is one);
+     *   5. otherwise a field whose label differs only by runs of space / _ / - ("Home_URL" vs "Home URL"), but ONLY
+     *      when that is unambiguous on both sides: exactly one persisted field and exactly one plan field have that
+     *      loose key. "Home-URL" and "Home_URL" next to each other are two columns, never one;
+     *   6. a plan field with no persisted counterpart is new: it keeps its id when nothing in the collection uses it,
      *      else it gets name_2, name_3, ... avoiding every id the collection already has and every id the plan uses.
+     * Clear-only fields (a column that is empty everywhere, see _planClearableFields) take part in 1 to 4 only, and
+     * are dropped when they match nothing: they never create a field and never take a loose match (clearing is the one
+     * destructive write, so it needs an exact label).
      * source_path is never a candidate. Persisted fields are never retyped or removed here. The plan is not mutated:
      * ctx.plan becomes a copy whose field ids, record values and property links of this collection are rewritten.
      * (A field whose label was edited in Thymer is therefore a new field on the next import, not a silent overwrite.)
      */
     _planReconcileFieldIds(ctx, entry) {
         const def = entry.def;
-        const planFields = (def.fields || []).map(fd => { const id = fd.id || this.slugify(fd.label); return { id, label: fd.label || id }; });
+        const planFields = (def.fields || []).map(fd => { const id = fd.id || this.slugify(fd.label); return { id, label: fd.label || id, clearOnly: fd.clearOnly === true }; });
         if (planFields.length === 0) return;
         const persisted = ((entry.api.getConfiguration() || {}).fields || []).filter(f => f && f.id);
-        const norm = (text) => String(text == null ? '' : text).normalize('NFC').trim().toLowerCase().replace(/[\s_-]+/g, ' ');
-        const candidates = persisted.filter(f => f.id !== 'source_path');
+        const written = (text) => String(text == null ? '' : text).normalize('NFC').trim();
+        const strict = (text) => written(text).toLowerCase();
+        const loose = (text) => strict(text).replace(/[\s_-]+/g, ' ');
+        // never a candidate: source_path, the built-in / system fields and read-only fields (an import cannot write them, so a
+        // column called "Created" must not be matched to the built-in created_at and have its values silently dropped)
+        const candidates = persisted.filter(f => f.id !== 'source_path' && !Plugin._PLAN_PROTECTED_FIELDS.has(f.id) && f.read_only !== true);
+        const tally = (items, key) => items.reduce((m, x) => m.set(key(x), (m.get(key(x)) || 0) + 1), new Map());
         const claimed = new Set();
         const finalIds = new Array(planFields.length).fill(null);
         const reasons = new Array(planFields.length).fill('');
+        const matched = new Array(planFields.length).fill(false);
+        const claim = (i, have, reason) => { claimed.add(have.id); finalIds[i] = have.id; matched[i] = true; reasons[i] = reason; };
+
+        // steps 1-4: the same id and label (1, 3), or the label alone when it is the only one left on both sides (2, 4)
+        for (const key of [written, strict]) {
+            planFields.forEach((pf, i) => {
+                const have = candidates.find(f => f.id === pf.id && !claimed.has(f.id) && key(f.label) === key(pf.label));
+                if (!matched[i] && have) claim(i, have, '');
+            });
+            const leftPlan = tally(planFields.filter((pf, i) => !matched[i]), pf => key(pf.label));
+            const leftPersisted = tally(candidates.filter(f => !claimed.has(f.id)), f => key(f.label));
+            planFields.forEach((pf, i) => {
+                if (matched[i] || leftPlan.get(key(pf.label)) !== 1 || leftPersisted.get(key(pf.label)) !== 1) return;
+                const have = candidates.find(f => !claimed.has(f.id) && key(f.label) === key(pf.label));
+                if (have) claim(i, have, 'matched-by-label');
+            });
+        }
+        // 5. same label ignoring separators, when exactly one field on each side (all of them, not only the unmatched) has that key
+        const allPlan = tally(planFields, pf => loose(pf.label));
+        const allPersisted = tally(candidates, f => loose(f.label));
         planFields.forEach((pf, i) => {
-            const have = candidates.find(f => f.id === pf.id && !claimed.has(f.id) && norm(f.label) === norm(pf.label));
-            if (have) { claimed.add(have.id); finalIds[i] = have.id; }
+            if (matched[i] || pf.clearOnly || allPlan.get(loose(pf.label)) !== 1 || allPersisted.get(loose(pf.label)) !== 1) return;
+            const have = candidates.find(f => !claimed.has(f.id) && loose(f.label) === loose(pf.label));
+            if (have) claim(i, have, 'matched-by-label');
         });
-        planFields.forEach((pf, i) => {
-            if (finalIds[i]) return;
-            const have = candidates.find(f => !claimed.has(f.id) && norm(f.label) === norm(pf.label));
-            if (have) { claimed.add(have.id); finalIds[i] = have.id; reasons[i] = 'matched-by-label'; }
-        });
+
+        // 6. what is left is new (clear-only fields are never new: they are dropped)
+        const drop = new Set(planFields.filter((pf, i) => pf.clearOnly && !matched[i]).map(pf => pf.id));
         const taken = new Set([...persisted.map(f => f.id), 'source_path', ...finalIds.filter(Boolean)]);
         planFields.forEach((pf, i) => {
-            if (finalIds[i] || taken.has(pf.id)) return;
+            if (finalIds[i] || pf.clearOnly || taken.has(pf.id)) return;
             taken.add(pf.id);
             finalIds[i] = pf.id;
         });
         planFields.forEach((pf, i) => {
-            if (finalIds[i]) return;
+            if (finalIds[i] || pf.clearOnly) return;
             let n = 2;
             while (taken.has(`${pf.id}_${n}`)) n++;
             finalIds[i] = `${pf.id}_${n}`;
@@ -5812,26 +5991,31 @@ class Plugin extends AppPlugin {
 
         const idMap = new Map();
         planFields.forEach((pf, i) => {
-            if (finalIds[i] === pf.id) return;
+            if (!finalIds[i] || finalIds[i] === pf.id) return;
             idMap.set(pf.id, finalIds[i]);
             ctx.report.remappedFields.push({ collection: def.key, label: pf.label, from: pf.id, to: finalIds[i], reason: reasons[i] });
             ctx.report.counts.fieldsRemapped++;
         });
-        if (idMap.size) this._planRemapFields(ctx, entry, idMap);
+        if (idMap.size || drop.size) this._planRemapFields(ctx, entry, idMap, drop);
     }
 
-    /** Rewrites field ids (old id -> new id, all at once) in one collection's definition, its records' values and its property links. */
-    _planRemapFields(ctx, entry, idMap) {
+    /**
+     * Rewrites field ids (old id -> new id, all at once) in one collection's definition, its records' values and its
+     * property links, and removes the fields in `drop` (clear-only fields that match no persisted field).
+     */
+    _planRemapFields(ctx, entry, idMap, drop = new Set()) {
         if (!ctx.planCopied) {
             ctx.plan = { ...ctx.plan, collections: ctx.plan.collections.slice(), records: ctx.plan.records.slice(), links: (ctx.plan.links || []).slice() };
             ctx.planCopied = true;
         }
         const plan = ctx.plan;
         const key = entry.def.key;
-        const def = { ...entry.def, fields: (entry.def.fields || []).map(fd => {
-            const id = fd.id || this.slugify(fd.label);
-            return idMap.has(id) ? { ...fd, id: idMap.get(id) } : fd;
-        }) };
+        const def = { ...entry.def, fields: (entry.def.fields || [])
+            .filter(fd => !drop.has(fd.id || this.slugify(fd.label)))
+            .map(fd => {
+                const id = fd.id || this.slugify(fd.label);
+                return idMap.has(id) ? { ...fd, id: idMap.get(id) } : fd;
+            }) };
         const at = plan.collections.indexOf(entry.def);
         if (at < 0) throw new Error(`collection ${key} is not in the plan`);
         plan.collections[at] = def;
@@ -5957,6 +6141,7 @@ class Plugin extends AppPlugin {
         const push = (f) => { if (f.id && !seen.has(f.id)) { seen.add(f.id); out.push(f); } };
         push({ id: 'source_path', label: 'Source Path', type: 'text', icon: 'ti-link', many: false, read_only: true, active: true });
         for (const fd of def.fields || []) {
+            if (fd.clearOnly) continue;   // declared only so an existing field's values can be cleared: never creates a field
             const type = this._planFieldType(fd);
             const id = fd.id || this.slugify(fd.label);
             const field = { id, label: fd.label || id, type, icon: this._planFieldIcon(fd), many: fd.many === true, read_only: false, active: true };
@@ -6192,18 +6377,25 @@ class Plugin extends AppPlugin {
      * The field ids that may be cleared on an updated record of one collection: the fields this plan DECLARES for it
      * (def.fields, which is the source's truth, even if no record in this export has a value for one, e.g. a column
      * that is now empty everywhere), that exist and are active and writable in the persisted collection, and are not a
-     * built-in or system field or source_path. Fields the plan does not declare (added by hand in Thymer, or declared
-     * only for another collection) are never in this set. Cached per collection.
+     * built-in or system field or source_path, and are of a type an import writes (text, url, hashtag, number, datetime,
+     * choice, record: a file / image / user field is never emptied). Fields the plan does not declare (added by hand in
+     * Thymer, or declared only for another collection) are never in this set. Cached per collection.
+     *
+     * The plan declares a field for a source column that is EMPTY in every row too (the Notion parser keeps such a
+     * column as a `clearOnly` field: its header is still in the CSV, so every old value of it is gone on purpose).
+     * Reconciliation (_planReconcileFieldIds) leaves such a field in the plan only when a persisted field has its label,
+     * so on a first import there is nothing to match and nothing is created or cleared.
      */
     _planClearableFields(ctx, entry) {
         if (entry.clearable) return entry.clearable;
         const persisted = new Map(((entry.api && entry.api.getConfiguration().fields) || []).map(f => [f.id, f]));
         const protectedIds = Plugin._PLAN_PROTECTED_FIELDS;
+        const writable = new Set(['text', 'url', 'hashtag', 'number', 'datetime', 'choice', 'record']);
         entry.clearable = new Set((entry.def.fields || [])
             .map(fd => fd.id || this.slugify(fd.label))
             .filter(id => {
                 const have = persisted.get(id);
-                return id && !protectedIds.has(id) && have && have.active !== false && have.read_only !== true;
+                return id && !protectedIds.has(id) && have && have.active !== false && have.read_only !== true && writable.has(have.type || 'text');
             }));
         return entry.clearable;
     }
@@ -6345,11 +6537,11 @@ class Plugin extends AppPlugin {
      *   an ISO instant with a zone ('2026-03-01T10:00:00Z', '...+01:00'): its local wall-clock time, as a Date shows it
      *     (types.d.ts:484-492: Thymer stores date and time in the local timezone);
      *   what the Notion parser reads ('March 1, 2026', '1 March 2026 3:30 PM', '2026/3/1', 'A → B'), but only when all of
-     *     it is understood (a range whose end is not, is not turned into its start).
+     *     it is understood (a range whose end is not, is not turned into its start, unless truncateRange is set).
      * Never goes through prop.setFromDate(): a Date made from 'YYYY-MM-DD' is UTC midnight, the evening before in any
      * timezone west of UTC.
      */
-    _planDateOf(value) {
+    _planDateOf(value, { truncateRange = false } = {}) {
         if (typeof value !== 'string' || typeof DateTime === 'undefined') return null;
         const text = value.trim();
         const plain = this._planDateValue(text);
@@ -6362,7 +6554,9 @@ class Plugin extends AppPlugin {
             return DateTime.dateAndTime(when.getFullYear(), when.getMonth(), when.getDate(), when.getHours(), when.getMinutes(), when.getSeconds()).value();
         }
         const cell = this._notionDateCell(text);
-        return cell && (!cell.range || cell.kept) ? this._planDateValue(cell.value) : null;
+        // truncateRange: a Notion range "A → B" whose end is not understood is stored as its start (what the Notion parser
+        // reports as "date ranges imported as their start date"); the writer asks for it for a persisted date field only
+        return cell && (!cell.range || cell.kept || truncateRange) ? this._planDateValue(cell.value) : null;
     }
 
     // ---- writing values, by the PERSISTED field -----------------------------------
@@ -6411,6 +6605,8 @@ class Plugin extends AppPlugin {
                 if (own.length) warn(fieldId, 'the collection has no such field');
                 continue;   // links to a missing field are reported by pass 3
             }
+            if (!persisted.active) { warn(fieldId, `the field "${persisted.label}" is archived in Thymer (it is not brought back)`); continue; }
+            if (persisted.readOnly) { warn(fieldId, `the field "${persisted.label}" is read-only`); continue; }
             if (persisted.type === 'record') {
                 if (own.length) warn(fieldId, `a record field in the collection, but "${own[0]}" is plain text with no link to a record`);
                 continue;   // links are written in pass 3, once every record exists
@@ -6439,12 +6635,14 @@ class Plugin extends AppPlugin {
                 const numbers = flat.map(v => (typeof v === 'number' ? (Number.isFinite(v) ? v : null) : this.coerceNumber(String(v))));
                 const bad = numbers.findIndex(n => n === null);
                 if (bad >= 0) return warn(fieldId, `"${flat[bad]}" is not a number (the field is a number field)`);
+                const lossy = flat.findIndex(v => typeof v === 'string' && !this._digitsFit(v.trim()));
+                if (lossy >= 0) return warn(fieldId, `"${flat[lossy]}" has more digits than a number field keeps exactly`);
                 if (!many && numbers.length > 1) return warn(fieldId, `${numbers.length} values for a one-value number field`);
                 value = many ? numbers : numbers[0];
                 break;
             }
             case 'datetime': {
-                const dates = flat.map(v => this._planDateOf(v));
+                const dates = flat.map(v => this._planDateOf(v, { truncateRange: true }));
                 const bad = dates.findIndex(d => d === null);
                 if (bad >= 0) return warn(fieldId, `"${flat[bad]}" is not a date this importer can read (the field is a date field)`);
                 if (!many && dates.length > 1) return warn(fieldId, `${dates.length} values for a one-value date field`);

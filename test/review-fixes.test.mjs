@@ -170,8 +170,8 @@ test('finding 5: distinct keys that slugify alike get distinct field ids and kee
     const idOf = (label) => fields.find(f => f.label === label).id;
     const a = plan.records.find(r => r.title === 'A');
     const b = plan.records.find(r => r.title === 'B');
-    assert.equal(a.values[idOf('Cost ($)')], 10);
-    assert.equal(b.values[idOf('Cost (%)')], 5);
+    assert.equal(a.values[idOf('Cost ($)')], '10', 'source spelling (round 3): a string, the engine converts it by the persisted field');
+    assert.equal(b.values[idOf('Cost (%)')], '5');
     assert.equal(a.values[idOf('Cost (%)')], undefined);
     assert.equal(Object.keys(a.values).length, 2);
     assert.deepEqual(plugin.validateImportPlan(plan), []);
@@ -198,7 +198,7 @@ test('finding 5: a key that slugifies to an already allocated "name_2" does not 
     const ids = plan.collections[0].fields.map(f => f.id);
     assert.equal(new Set(ids).size, 3, ids.join(','));
     const a = plan.records[0];
-    assert.deepEqual(Object.values(a.values).sort(), [1, 2, 3]);
+    assert.deepEqual(Object.values(a.values).sort(), ['1', '2', '3']);
 });
 
 test('finding 5 (Notion): column ids were already collision-free, including the "(text)" companion', async () => {
@@ -209,7 +209,7 @@ test('finding 5 (Notion): column ids were already collision-free, including the 
     const ids = plan.collections[0].fields.map(f => f.id);
     assert.deepEqual(ids, ['cost', 'cost_2', 'cost_3']);
     const drill = plan.records[0];
-    assert.deepEqual(drill.values, { cost: 10, cost_2: 5, cost_3: 'high' });
+    assert.deepEqual(drill.values, { cost: '10', cost_2: '5', cost_3: 'high' });
 });
 
 // ---------------------------------------------------------------------------------------------

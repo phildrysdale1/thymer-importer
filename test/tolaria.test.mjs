@@ -84,7 +84,7 @@ test('fixture plan: fields, merged case variants, choice/url/number/datetime, re
 
     const records = byKey(plan.records);
     assert.deepEqual(records['beta-project.md'].values, { status: 'Paused', url: 'https://example.invalid/beta' }, 'first spelling wins when one note has both');
-    assert.deepEqual(records['alpha-project.md'].values, { status: 'Active', cadence: 'Weekly', effort: 3, due: '2026-03-01' });
+    assert.deepEqual(records['alpha-project.md'].values, { status: 'Active', cadence: 'Weekly', effort: '3', due: '2026-03-01' });
     assert.deepEqual(records['home-lab.md'].values.kind, ['Hardware', 'Hobby']);
     assert.deepEqual(records['recipes.md'].values.kind, ['Food'], 'a one-item YAML list stays multi-value');
     for (const r of plan.records) assert.ok(!Object.keys(r.values).some(k => k.startsWith('_') || k === 'visible' || k === 'color' || k === 'type'), r.key);
@@ -414,7 +414,8 @@ test('performTolariaImport: parses, applies and renders counts, unresolved links
         p.applyImportPlan = (plan, opts) => origApply(plan, { ...opts, ...fast });
         await p.performTolariaImport(dom.dialog, {}, dirHandle(FIXTURE));
         const text = dom.text();
-        assert.match(text, /Import finished with problems|Import complete/);
+        assert.match(text, /^Finished with warnings/, 'the fixture note with both Status and status raises a warning');
+        assert.match(text, /beta-project\.md: the key "status" is a second spelling/);
         assert.match(text, /Collections: 3 created, 0 updated/);
         assert.match(text, /Records: 5 created, 0 updated/);
         assert.match(text, /Links: \d+ resolved, 3 unresolved/);
