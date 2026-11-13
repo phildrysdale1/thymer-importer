@@ -1,0 +1,4 @@
+
+# Real exports used for local testing. Never commit personal data.
+test/fixtures/private/
+node_modules/

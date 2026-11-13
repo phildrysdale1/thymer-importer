@@ -1,6 +1,6 @@
 # Thymer Importer Plugin
 
-A powerful import plugin for Thymer that brings your data from CSV, Obsidian, Logseq and Joplin into Thymer with a streamlined, intelligent workflow.
+A powerful import plugin for Thymer that brings your data from CSV, Obsidian, Logseq, Joplin, Tolaria and Notion exports into Thymer with a streamlined, intelligent workflow.
 
 ## Features
 
@@ -16,6 +16,14 @@ A powerful import plugin for Thymer that brings your data from CSV, Obsidian, Lo
 - **Smart property detection** - analyzes your notes to recommend field types
 - **Folder organization** - preserves folder structure as filterable properties
 - **Wiki-link resolution** - converts `[[Note Name]]` to actual Thymer record references
+
+### 🗂️ Tolaria & Notion Export Import
+- **Tolaria vaults** - note types become collections, `[[wikilinks]]` and relation properties become record references
+- **Notion exports** (Markdown & CSV) - each database becomes a collection, relations between databases are kept
+- **Images** are uploaded and inserted into the notes
+- **Import report** - what was created or updated, which links stayed text, what was skipped
+- **Name-clash prompt** - asks before importing into a collection that already exists
+- **Safe re-import** - running it again updates the same records instead of duplicating them
 
 ### 📅 Integrated Journal Import (New!)
 - **Checkbox option** in the markdown import flow
@@ -69,6 +77,48 @@ Alice,30,Active,2024-01-15
 - Markdown content → Formatted notes
 - `[[Wikilinks]]` → Clickable record references
 - Daily notes → Journal entries (if checkbox enabled)
+
+### Import Tolaria
+
+1. Run **Import Data (CSV or Markdown)** → Select **Markdown Import**
+2. Choose **Tolaria**
+3. Pick your vault folder (no collection to choose: the vault defines them)
+4. **Import**
+
+**What gets imported:**
+- Notes with `type: Type` define **collections** (name from `sidebar label`, icon from `_icon`, body → description); every other note becomes a **record** in the collection of its `type:`. Types with no notes get no collection, and untyped notes go to "Notes".
+- Frontmatter → properties: `status` / `kind` → choice, `url` → url, numbers → number, `YYYY-MM-DD` → date, the rest → text.
+- Keys whose values are all `[[wikilinks]]` (e.g. `related_to`, `belongs_to`) → **record references**
+- `[[note-name]]` / `[[note-name|label]]` in the text → clickable **record references**, matched by file name
+- `![](attachments/…)` → uploaded **images**
+- Skipped: `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` at the vault root, dot-folders (`.git`, `.claude`, …) and Tolaria UI state (`_organized`, `_favorite`, `_icon`, `visible`, `color`, …)
+- Links to notes that don't exist stay as `[[text]]`
+
+**Import report:** collections, records, links and images created, updated or failed; types without notes; untyped notes; skipped files; links left as text; errors; and warnings grouped by kind (the status says "Finished with warnings").
+
+### Import Notion Export
+
+1. In Notion, export with **Markdown & CSV** and **include subpages**, then unzip it
+2. Run **Import Data (CSV or Markdown)** → Select **Markdown Import** → **Notion export**
+3. Pick the unzipped folder. Several database exports can sit side by side in one folder; relations between them are resolved when they are imported together.
+4. **Import**
+
+**What gets imported:**
+- Each **database** → a **collection**, each row → a **record** (properties from the CSV, text from the row's page). Column types are detected from the data: text, number, date (ranges included), URL, and single or multi-select.
+- **Relation columns** (Notion page links) → **record references** to rows of any database in the export
+- Standalone pages → a **Notion Pages** collection
+- Images in pages → uploaded **images**; `<aside>` callouts → quotes; the repeated property list at the top of row pages is dropped
+- Left as text and listed in the report: relations to pages outside the export, and columns that only name rows of another database
+- Empty columns create no field (on a re-import they clear what an earlier import stored in the same column); inline `data:` images are skipped
+
+**Import report:** counts, links left as text, relations to pages outside the export, missing images, rows without a page and pages without a row, errors, and warnings grouped by kind (the status says "Finished with warnings").
+
+### If a collection already exists (Tolaria and Notion)
+
+Before anything is written, the plugin compares the collections the import would use with the ones in your workspace. A collection with the same name that was **imported from this source before** (it has a `Source Path` field and a record from this import) is updated silently, which is what makes re-import work. Any other same-named collection (say, your own "Notes" or "Projects") is shown in the dialog, and you choose:
+
+- **Import into separate collections** (default) - every collection of the import gets a prefix you can edit (`Tolaria · ` or `Notion · `), so the source stays together. Import again with the same prefix to update them.
+- **Merge into existing collections** - records and new fields are added to the existing collections, and an existing record with the same title and no `Source Path` is overwritten.
 
 ### Fix Broken Wikilinks
 
@@ -156,11 +206,31 @@ vault/
 
 ## Technical Details
 
-- **Version:** 0.0.7
+- **Version:** 0.0.13
 - **Type:** App Plugin
 - **Dependencies:** None
-- **Size:** ~3,300 lines
-- **APIs Used:** Collection API, Data API, Journal API, native `insertFromMarkdown()`
+- **Size:** ~6,300 lines
+- **APIs Used:** Collection API (`createCollection`, `getConfiguration` / `saveConfiguration`), Data API (`getAllCollections`, `uploadBlob`), Record and Property API (including record-reference properties), Line Item API (`createLineItem`, `setSegments`, `setBlob`), `DateTime`, Journal API, native `insertFromMarkdown()`
+
+## Development / Tests
+
+The parsing and import logic can run outside Thymer. The tests need Node 20+ and no dependencies:
+
+```bash
+npm test
+```
+
+They load `plugin.js` with a stub `AppPlugin` and run it against an in-memory Thymer API, using small synthetic fixtures in `test/fixtures/`. See [test/README.md](test/README.md).
+
+To also run the Tolaria and Notion sources over your own exports (the tests are skipped otherwise), point these at local folders. Real exports are never committed:
+
+- `TOLARIA_VAULT` - a Tolaria vault folder
+- `NOTION_EXPORT` - an unzipped Notion Markdown & CSV export
+- `NOTION_EXPECT` - optional path to a JSON file of expected counts for `NOTION_EXPORT`
+
+```bash
+TOLARIA_VAULT=/path/to/vault NOTION_EXPORT=/path/to/export npm test
+```
 
 ## Contributing
 

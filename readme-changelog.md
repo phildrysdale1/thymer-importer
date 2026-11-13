@@ -1,6 +1,100 @@
 # Changelog — Thymer Importer
 
-Tracks **`plugin.js`** / **`plugin.json`** behavior. Current release: **v0.0.12** (see **`VERSION`** in **`plugin.js`**).
+Tracks **`plugin.js`** / **`plugin.json`** behavior. Current release: **v0.0.13** (see **`VERSION`** in **`plugin.js`**).
+
+---
+
+## v0.0.13 — Tolaria and Notion export sources, shared ImportPlan engine
+
+### New sources
+
+**Import Markdown** has two new sources, **Tolaria** and **Notion export**. Both build their own collections, so the collection picker and the journal option are hidden for them.
+
+- **Tolaria** (a vault of `*.md` files with YAML frontmatter): notes with **`type: Type`** define collections (name from **`sidebar label`**, icon from **`_icon`**, body → description) and every other note becomes a record in the collection of its **`type:`**. Frontmatter keys whose values are all **`[[wikilinks]]`** become record-reference properties, **`[[slug]]`** links in the body become record references (matched by file name), and **`attachments/`** images are uploaded and inserted as images. Tolaria UI state (**`_*`**, **`visible`**, **`color`**), agent docs (**`AGENTS.md`**, **`CLAUDE.md`**, …) and dot-folders are skipped.
+- **Notion export** (unzipped **Markdown & CSV** export, subpages included): each database becomes a collection, each row a record, and standalone pages go to a **Notion Pages** collection. Column types are detected from the CSV, relation columns (Notion page URLs) become record references resolved by page id across every database in the folder, and `<aside>` callouts become quotes. Title id suffixes are dropped.
+- Both show an **import report** when done: collections and records created or updated, links resolved or left as text, images uploaded, and anything skipped or failed.
+- Re-importing is safe: records are matched by **`source_path`** and updated in place.
+
+### Shared ImportPlan engine
+
+- A source parser is a pure function that returns an **ImportPlan** (collections, records, property values, links, assets). **`applyImportPlan()`** performs every Thymer write: collections (name, icon, description, fields), records, links, images, then journal entries.
+- **`LinkIndex`** maps paths, file-name slugs, Notion page ids and titles to records, so links and relation properties are rewritten after every record exists.
+- The existing CSV, Obsidian, Joplin, Logseq and journal flows do not use the engine and are unchanged.
+
+### Date-only values on the new path
+
+Date-only values (`2026-03-01`, Notion's `August 30, 2021`) are written with **`DateTime.dateOnly`**, so they no longer shift by the UTC offset; values with a time keep it, and Notion date ranges are imported as ranges.
+
+### Folder picker for the new sources
+
+In Thymer Desktop **`showDirectoryPicker()`** rejects with **`AbortError`** even after a folder was chosen, which looks like a cancel. Tolaria and Notion therefore use **`pickFolderViaInput()`** (`<input type="file" webkitdirectory>`), which works in Thymer Desktop and in browsers. The other sources still use **`pickFolder()`**.
+
+### Name-clash warning
+
+The importer finds target collections by name, so a workspace that already had a **Notes** or **Projects** collection would silently receive the import. Before writing anything, Tolaria and Notion now compare the planned collection names with the workspace:
+
+- A same-named collection counts as **a previous import from this source** when it has a **`source_path`** field and one of its records has a **`source_path`** of a planned record. It is merged into silently, so re-import keeps working.
+- Any other same-named collection is a **clash**. The dialog lists the clashes and asks:
+  - **Import into separate collections** (default): every planned collection gets an editable prefix (**`Tolaria · `** / **`Notion · `**), so the source stays together. Importing again with the same prefix updates those collections.
+  - **Merge into existing collections**: the previous behavior.
+- No clash, no extra step.
+
+### Review fixes
+
+Fixes from the review of the pull request, all on the new sources and the shared engine (the existing CSV, Obsidian, Joplin, Logseq and journal flows are unchanged):
+
+- **Notion, id-suffixed rows folder:** some exports name the rows folder after the whole csv file (**`Tasks <id>/`** next to **`Tasks <id>.csv`**). The folder is found by the full csv stem, then the name without the id, then a sibling folder carrying the database id, then the sanitised-name fallback, so row pages are claimed instead of landing in **Notion Pages** as empty rows.
+- **Notion, rows without a page:** two csv rows with the same title and no page shared one **`source_path`**, and the second overwrote the first. The second, third, … get **`#2`**, **`#3`** after the title (in csv order); the first keeps its old path, so earlier imports still match. The report lists the affected titles.
+- **Re-import matches by `source_path` alone:** a note whose title changed but whose file did not is updated, not duplicated. Records with no **`source_path`** are still adopted by title, once. If the title changed, the record is **renamed** through its built-in title property (**`record.prop('Title').set(...)`**, then **`'title'`**) and counted as **renamed** in the report; if that is not possible it is a **`title-not-renamed`** warning and the record keeps its old title.
+- **Choices on re-import:** when the field that already exists in Thymer is a choice, new values are added as options even if this run infers a text column. Existing fields are never retyped.
+- **Tolaria field ids:** keys that slugify alike (**`cost ($)`**, **`cost (%)`**) get distinct ids (**`cost`**, **`cost_2`**), allocated in sorted key order so a re-import maps to the same fields. Case variants (**`Status`** / **`status`**) still share one field.
+- **Cleared values:** on an updated record, a field the plan declares for that collection is **cleared** when the source has no value for it any more (an emptied cell, a removed frontmatter key, a relation that is gone). Only declared fields are touched: fields you added in Thymer, **`source_path`**, built-in/system fields and read-only fields are left alone. A declared column that is missing from the export entirely also clears, because the plan declares it and the source is the truth; if you keep your own data in a field that a source also declares, it is replaced on re-import. Clearing is a single **`set([])`** (multi-value) or **`set(null)`** call per property; what needs clearing is read before the record is written, because Thymer's reads right after a write are stale. The number of cleared values is in the import report.
+
+### Review fixes (round 2)
+
+A second review found one bug in several shapes: between two imports the inferred shape of a column can change (a date column gets one text value, a relation column's targets move into the export, a multi-select gets more distinct values, a new key slugifies like an old one), and the writers trusted the new inference instead of the collection that already exists. **On re-import the collection in Thymer is authoritative.** Fixes, all on the new sources and the shared engine:
+
+- **Fields are matched by label.** An existing collection's fields decide which field id each field of the export writes to: the same label (case-insensitive, ignoring runs of space, **`_`** and **`-`**) is the same field, whatever id this run would have allocated. This stops Tolaria / Notion ids shifting when a colliding key (**`cost ($)`** next to an existing **`cost (%)`**) or column first appears in a later export. A field with no counterpart is new and gets an id that nothing in the collection uses (**`cost_2`**, **`cost_3`**, …). **`source_path`** is never matched. If you rename a field's label in Thymer, the next import adds a new field instead of writing into the renamed one. The report lists remapped fields.
+- **Every value is written by the persisted field.** Its type, single / many and options decide the write; fields are never retyped or removed. A value that cannot be written (text in a number field, a date that does not parse, a plain value for a record field) is a **`property-not-set`** warning and the old value stays.
+  - **Dates** go through **`DateTime.dateOnly`** / **`dateAndTime`** only (also ISO instants such as **`2026-03-02T12:00:00Z`**, in local time, and Notion's **`March 1, 2026`** forms), never **`setFromDate`**, so a date-only value cannot slip to the evening before.
+  - **Links in a field that is not a record field** (url, text, ...) write the link's source text (the URL or text from the export), never a GUID.
+  - **Choices:** a multi-value field splits a text cell into tokens (comma + space, like the Notion multi-select parser) and adds missing options one by one, never a combined **`Red, Blue`** option; a single-value field takes the whole value as one option.
+  - **Text / url** take the string form; several values for a one-value field are joined with **`, `**. **Numbers** must be numbers.
+- **Notion: a renamed page is the same record.** A page's 32-hex id is in its file name (**`Title <id>.md`**) and survives a rename in Notion. Existing records are also looked up by that id, so the record is updated, its **`source_path`** follows the page and a changed title renames it, instead of a duplicate appearing. The name-clash prompt recognises a previous import by page id too. Rows without a page (no id) still match by path.
+- **`existing: 'skip'`** now skips the link and image passes for skipped records too (no second image, no overwritten relations). Skipped records stay link targets for new ones.
+- **`source_path`** is written as plain text, never through the date path.
+
+### Review fixes (round 3)
+
+A third review found four more ways a later export could disagree with what an earlier import left in Thymer, and a self-review of every re-import path (the parsers' value shaping, reconciliation, the writers, clearing, renaming, page-id matching) found more of the same kind. All on the new sources and the shared engine; the existing CSV, Obsidian, Joplin, Logseq and journal flows are unchanged.
+
+- **Label matching is no longer loose.** Round 2 treated **`Home-URL`** and **`Home_URL`** as one label, so a new column could take over an existing field. A plan field is now matched to a persisted field **as written** first (same id, then the only one left on both sides), then **ignoring case** (so **`Status`** / **`status`** still merge), and only then ignoring runs of space / **`_`** / **`-`**, and that last step **only when it is unambiguous on both sides**: exactly one persisted field and exactly one field of the export have that key. A tie is never broken by position. When the export has a column called **`status`** and the collection has both **`Status`** and **`status`**, the exact one wins. Read-only and built-in fields (**`created_at`** ...) are never candidates, so a column called "Created" gets a field of its own instead of being matched to a field an import cannot write.
+- **The plan keeps the source spelling.** The parsers used to turn a number column into numbers (and a date column into ISO dates, a multi-select into a de-duplicated list) before they knew what the field in Thymer was, so a text field whose column later looked like a number lost its spelling (**`1.50`** became **`1.5`**). Number, date and choice cells now stay exactly as the source writes them and **the persisted field converts them when it writes**: a number field takes a number, a date field a **`DateTime`**, a choice field its options, a text field the text as written. A first import that creates a number or date field still stores numbers and dates, and a Notion date range whose end is not understood is still stored as its start (reported as before).
+  - Columns of **zero-padded** values (**`007`**, **`000123`**) and of numbers with **more than 15 significant digits** are text, not numbers: a number field would store **`7`** or round an id. A persisted number field refuses a value with more digits than it keeps exactly (a warning, the old value stays).
+  - A value that is not on the calendar (**`February 30, 2026`**, **`2026-13-45`**, **`25:00`**) makes a text column instead of a date column that dropped it.
+- **Empty columns clear.** A Notion column whose header is still in the CSV but whose cells are all empty is kept in the plan as a **clear-only** field. On a first import nothing is created for it (there is nothing to match). On a re-import it is matched to the existing field **by its exact label (as written or ignoring case, never by the loose comparison)** and the values an earlier import stored are cleared (**`set(null)`** / **`set([])`**, counted in the report). A relation column's **"(text)"** companion is cleared the same way when no unresolved text is left, or the column is empty. Only fields of a type an import writes are ever cleared (never a file, image or user field).
+  - **Tolaria:** a frontmatter key that is **present but blank** (**`due:`**, **`due: null`**, **`due: []`**) in every note of a collection is the same signal and clears the same way. A key that is **removed** from every note is *not* a signal that is strong enough: a note that lacks a key says nothing a column header does (notes get edited, templates change, a key can simply be absent), so its old values are left alone. A key removed from *some* notes still clears those notes' values, as in round 1. (The round-1 note above says a declared column "missing from the export entirely" clears: that only ever held for columns the plan still declares, which for Notion means present in the CSV.)
+- **Warnings are shown.** Both the Tolaria and the Notion report list every warning **grouped by code** (count and the first three examples, named by record title) and the completion status says **"Finished with warnings"** when there are any (Tolaria used to say "Import complete" even when an engine warning, such as a value that had been rejected, was reported). Problems still take precedence ("Finished with problems"). What the parsers noted while reading the source is listed too, under **`reading`**.
+- **Self-review.**
+  - A field **archived** in Thymer is not written to, not brought back, and the warning says so (it used to be a vague "no such property").
+  - **Look-alike Tolaria keys** (**`cost_x`** and **`cost x`** both read "Cost X") keep their own spelling as the field label, so a third look-alike key cannot shift ids onto the wrong field.
+  - A note that has two spellings of one key (**`Status`** and **`status`**) keeps the first value, as before, and now says so.
+  - Two records whose **`source_path`** differ only by case are one record on re-import; the plan is now flagged (**`duplicate-source-path`**) instead of the second silently overwriting the first.
+  - A property-based test (two random exports, imported one over the other with Thymer's stale reads) checks that nothing is dropped or overwritten without a warning and that a repeat import changes nothing.
+- **Left alone, on purpose** (each has a test that pins it):
+  - A column **renamed** in Notion is a new column: the old field keeps its old values (a CSV has no column ids to tell a rename from a new column).
+  - A key or column **removed** from the export, and a record or file **deleted** from it, leave what is in Thymer alone: an import never deletes.
+  - A Tolaria note that **moves** to another path is a new record (a vault has no stable ids; Notion pages are matched by page id and are fine). A Notion page that moves to another database is a new record in that collection.
+  - Rows without a page that share a title are matched by their **order in the CSV** (**`#2`**, **`#3`**); a title change or a reorder of such rows is not detectable.
+  - A property you edited in Thymer, and a record's body, are replaced by the source on re-import (the source is the truth, as before).
+  - A choice option you **archived** is not brought back: values that need it get a warning each time.
+  - A relation's unresolved text goes to the "(text)" companion as the URL / text list it always did.
+  - Two look-alike keys that already existed under one shared label (imported before this round) are matched by id.
+
+### Tests
+
+- **`npm test`** runs a Node test harness (Node 20+, no dependencies) that loads **`plugin.js`** with a stub **`AppPlugin`** and an in-memory Thymer API. Fixtures are synthetic. See **`test/README.md`**.
+- Optional env vars run the parsers over real exports: **`TOLARIA_VAULT`**, **`NOTION_EXPORT`**, **`NOTION_EXPECT`**.
 
 ---
 
